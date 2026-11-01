@@ -1,0 +1,17 @@
+build/
+build-ninja/
+cmake-build-*/
+out/
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.DS_Store
+Thumbs.db
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe

@@ -1,0 +1,183 @@
+plugins {
+    id 'base'
+}
+
+group = 'sunnyslopes.lowydripstonecavefinder'
+version = '1.0.0'
+
+/*
+ * LowYDripstoneCaveFinderBase owns every line of native code:
+ *
+ *   lowydripstonecavefinder.cpp        engine, phase-0/1/2 + large-pit search
+ *   dripstonecave_finder.cpp           scan / refine primitives
+ *   LargePitSearch.cpp                 full-map large-pit search
+ *   BiomeSampler.cpp, OctaveFieldCache.cpp
+ *   Thread.h, SearchConfig.h, cxx_compat/
+ *   lowydripstonecavefinder_cli.cpp    standalone --option CLI with --out txt
+ *   jni/                               libDripstoneCaveFinderLibJ.dll for the GUI
+ *   cubiomes/                          nested git submodule
+ *
+ * The Java module consumes two artifacts from this subproject:
+ *
+ *   :lowydripstonecavefinderbase:copyNativeArtifacts -> build/native/libDripstoneCaveFinderLibJ.dll
+ *   :lowydripstonecavefinderbase:copyCliArtifact     -> build/cli/lowydripstonecavefinder-cli.exe
+ *
+ * The project can also be built standalone, without the Java module:
+ *
+ *   powershell -ExecutionPolicy Bypass -File build_cli_msys2.ps1
+ *   powershell -ExecutionPolicy Bypass -File build_jni_msys2.ps1
+ */
+
+def nativeOutDir = layout.buildDirectory.dir('native').get().asFile
+def objDir = layout.buildDirectory.dir('obj').get().asFile
+def cliOutDir = layout.buildDirectory.dir('cli').get().asFile
+def cliObjDir = layout.buildDirectory.dir('cli-obj').get().asFile
+
+def msysRoot = System.getenv('MSYS2_ROOT') ?: 'C:\\msys64'
+
+def findMsysBin = {
+    def candidates = [
+            file("${msysRoot}/ucrt64/bin"),
+            file("${msysRoot}/mingw64/bin")
+    ]
+    return candidates.find { new File(it, 'gcc.exe').exists() && new File(it, 'g++.exe').exists() }
+}
+
+def msysBin = findMsysBin()
+
+def resolveJavaHome() {
+    def javaHome = System.getenv('JAVA_HOME')
+    if (javaHome == null || javaHome.isEmpty()) {
+        javaHome = System.getProperty('java.home')
+    }
+    def javaHomeFile = file(javaHome)
+    if (javaHomeFile.name.equalsIgnoreCase('jre') && javaHomeFile.parentFile != null) {
+        javaHome = javaHomeFile.parentFile.absolutePath
+    }
+    if (javaHome.endsWith('\\bin') || javaHome.endsWith('/bin')) {
+        javaHome = file(javaHome).parentFile.absolutePath
+    }
+    def jdk17 = file('C:/Program Files/Java/jdk-17')
+    if ((!file("${javaHome}/include/jni.h").exists()) && jdk17.exists()) {
+        javaHome = jdk17.absolutePath
+    }
+    return javaHome
+}
+
+tasks.register('checkCubiomesSubmodule') {
+    group = 'verification'
+    description = 'Verifies the nested cubiomes submodule of LowYDripstoneCaveFinderBase is initialized'
+    doLast {
+        if (!file('.gitmodules').exists() || !file('.gitmodules').text.contains('cubiomes')) {
+            throw new GradleException(
+                    'LowYDripstoneCaveFinderBase/.gitmodules does not declare the nested cubiomes submodule. '
+                            + 'Restore it before building.')
+        }
+        if (!file('cubiomes/generator.c').exists()) {
+            throw new GradleException(
+                    'cubiomes submodule is not initialized. Run in LowYDripstoneCaveFinderBase: '
+                            + 'git submodule update --init --recursive')
+        }
+    }
+}
+
+def requireMsys2 = {
+    if (msysBin == null) {
+        throw new GradleException(
+                "MSYS2 gcc/g++ not found. Expected ${msysRoot}\\ucrt64\\bin or ${msysRoot}\\mingw64\\bin. "
+                        + 'Install MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-toolchain')
+    }
+}
+
+tasks.register('buildNativeMsys2', Exec) {
+    group = 'build'
+    description = 'Build libDripstoneCaveFinderLibJ.dll via MSYS2 gcc/g++ (LowYDripstoneCaveFinderBase)'
+    dependsOn checkCubiomesSubmodule
+    outputs.dir(nativeOutDir)
+
+    doFirst {
+        requireMsys2()
+        nativeOutDir.mkdirs()
+        objDir.mkdirs()
+    }
+
+    def javaHome = resolveJavaHome()
+    def script = file('build_jni_msys2.ps1')
+    commandLine 'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', script.absolutePath,
+            '-OutDir', nativeOutDir.absolutePath,
+            '-ObjDir', objDir.absolutePath,
+            '-JavaHome', javaHome
+}
+
+tasks.register('copyNativeArtifacts') {
+    dependsOn buildNativeMsys2
+    group = 'build'
+    description = 'Ensure the Windows JNI library is in build/native'
+    outputs.dir(nativeOutDir)
+    doLast {
+        def dll = new File(nativeOutDir, 'libDripstoneCaveFinderLibJ.dll')
+        if (!dll.exists()) {
+            throw new GradleException("Native DLL missing after MSYS2 build: ${dll}")
+        }
+        logger.lifecycle("Native artifact ready: ${dll}")
+    }
+}
+
+// Self-contained C++ CLI. It links the same engine and nested cubiomes
+// checkout, so the resulting exe needs no DLL or external source tree.
+tasks.register('buildCliMsys2', Exec) {
+    group = 'build'
+    description = 'Build the standalone lowydripstonecavefinder-cli.exe via MSYS2 gcc/g++'
+    dependsOn checkCubiomesSubmodule
+    outputs.dir(cliOutDir)
+
+    doFirst {
+        requireMsys2()
+        cliOutDir.mkdirs()
+        cliObjDir.mkdirs()
+    }
+
+    def script = file('build_cli_msys2.ps1')
+    commandLine 'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', script.absolutePath,
+            '-OutDir', cliOutDir.absolutePath,
+            '-ObjDir', cliObjDir.absolutePath
+}
+
+tasks.register('copyCliArtifact') {
+    dependsOn buildCliMsys2
+    group = 'build'
+    description = 'Ensure the standalone CLI is in build/cli'
+    outputs.file(new File(cliOutDir, 'lowydripstonecavefinder-cli.exe'))
+    doLast {
+        def exe = new File(cliOutDir, 'lowydripstonecavefinder-cli.exe')
+        if (!exe.exists()) {
+            throw new GradleException("Standalone CLI missing after MSYS2 build: ${exe}")
+        }
+        logger.lifecycle("Standalone CLI ready: ${exe}")
+    }
+}
+
+tasks.register('buildNativeCli') {
+    group = 'build'
+    description = 'Alias for copyCliArtifact'
+    dependsOn copyCliArtifact
+}
+
+tasks.named('assemble') {
+    dependsOn copyNativeArtifacts, copyCliArtifact
+}
+
+configurations {
+    nativeLibs {
+        canBeConsumed = true
+        canBeResolved = false
+    }
+}
+
+artifacts {
+    nativeLibs(nativeOutDir) {
+        builtBy copyNativeArtifacts
+    }
+}
