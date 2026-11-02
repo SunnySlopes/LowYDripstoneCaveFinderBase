@@ -139,4 +139,9 @@ build_cli_msys2.ps1                MSYS2 构建独立 exe
 
 ## 许可
 
-`LICENSE` 为 cubiomes 的 MIT 许可文本；引擎代码遵循上游项目许可。
+本项目以 **MIT** 许可证发布，详见 `LICENSE`（Copyright (c) 2026 SunnySlopes）。
+
+原生引擎基于 [cubiomes](https://github.com/Cubitect/cubiomes) 及其活跃分支
+[xpple/cubiomes](https://github.com/xpple/cubiomes)（MIT，Copyright (c) 2020 Cubitect），
+上游许可文本保留在 `cubiomes/LICENSE`；战利品相关代码另有
+`cubiomes/loot/LICENSE_loot_library.h.txt`（MIT，Copyright (c) 2024 ScriptLine）。
