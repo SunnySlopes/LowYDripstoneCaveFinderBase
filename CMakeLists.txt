@@ -57,6 +57,7 @@ add_library(lowydripstonecavefinder-core STATIC
     lowydripstonecavefinder.cpp
     BiomeSampler.cpp
     OctaveFieldCache.cpp
+    GpuCoarse.cpp
     ${LOWYD_CUBIOMES_SOURCES}
 )
 

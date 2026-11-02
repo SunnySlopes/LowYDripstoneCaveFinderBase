@@ -15,6 +15,9 @@
 #include "lowydripstonecavefinder.h"
 
 #include "Bench.h"
+#include "BiomeSampler.h"
+#include "GpuCoarse.h"
+#include "SearchConfig.h"
 #include "cubiomes/biomes.h"
 #include "cubiomes/util.h"
 
@@ -24,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -93,6 +97,8 @@ struct Options {
     long long weirdnessSeed = 0;
 
     bool bench = false;
+    /** >0: run the GPU-vs-CPU coarse-grid verification over chunks of this side. */
+    int gpuVerify = 0;
 
     bool help = false;
     bool version = false;
@@ -149,9 +155,23 @@ void printUsage(std::ostream &os)
         "Output:\n"
         "  --limit <int>           maximum result rows, default 0 = all\n"
         "  --out <file>            also write the text report to <file>\n"
+        "  --backend auto|cpu|gpu  coarse-noise backend, default auto\n"
+        "                          auto = OpenCL for windows >= 524288 blocks per\n"
+        "                          side when at most 12 threads are used, and for\n"
+        "                          windows >= 2000001 blocks per side regardless\n"
+        "                          (below that the CPU path is faster);\n"
+        "                          cpu  = never load OpenCL;\n"
+        "                          gpu  = use OpenCL for any window (falls back with\n"
+        "                          a reason string when no device is usable).\n"
+        "                          The LOWYD_BACKEND environment variable sets the\n"
+        "                          default, LOWYD_GPU_DEVICE picks a device by name\n"
+        "                          substring (iGPU vs dGPU).\n"
+        "  --gpu-verify <side>     compare the OpenCL coarse grids against the CPU\n"
+        "                          implementation over chunks of <side> blocks and\n"
+        "                          print the mismatch counts (plan §7.2); no search\n"
         "  --bench                 print per-stage timings to stderr after the run\n"
         "                          (phase0 / cont mask / weird ring / climate coarse /\n"
-        "                          phase2, plus candidate counts and peak working set)\n"
+        "                          phase2 / gpu, plus candidate counts and peak RAM)\n"
         "  --help, -h              show this help\n"
         "  --version               show CLI / engine versions\n"
         "\n"
@@ -420,6 +440,20 @@ Options parseOptions(int argc, char **argv)
         else if (arg == "--bench")
         {
             options.bench = true;
+        }
+        else if (arg == "--backend")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            lowyd_gpu::Backend backend = lowyd_gpu::Backend::Auto;
+            if (!lowyd_gpu::parseBackend(std::string(value).c_str(), &backend))
+                usageError("invalid --backend: " + std::string(value));
+            lowyd_gpu::setBackend(backend);
+        }
+        else if (arg == "--gpu-verify")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parseInt(value, options.gpuVerify) || options.gpuVerify <= 0)
+                usageError("invalid --gpu-verify: " + std::string(value));
         }
         else
         {
@@ -695,6 +729,8 @@ std::string formatBenchReport(double wallSeconds)
         out << std::setprecision(2) << " (" << (100.0 * static_cast<double>(passed) / static_cast<double>(tiles)) << "%)";
     out << std::setprecision(1) << "\n";
     out << "ring centers summed   " << c.ringCenters.load() << "\n";
+    out << "ring candidates       " << c.ringCandidates.load()
+        << "   max per chunk  " << c.ringCandidatesMax.load() << "\n";
     out << "climate subsearches   " << c.coarseSubsearches.load()
         << "   coarse cells  " << c.coarseCells.load() << "\n";
     out << "phase2 candidates     " << c.phase2Candidates.load() << "\n";
@@ -729,10 +765,262 @@ std::string formatBenchReport(double wallSeconds)
     return out.str();
 }
 
+/** Backend device / counters, printed next to --bench. */
+std::string formatGpuReport()
+{
+    const lowyd_gpu::Info &info = lowyd_gpu::info();
+    std::ostringstream out;
+    out << "\n=== bench: coarse backend ===\n";
+    out << "requested             " << lowyd_gpu::backendName(lowyd_gpu::backend()) << "\n";
+    if (!info.probed)
+    {
+        out << "state                 not probed (window below the GPU gate)\n";
+        return out.str();
+    }
+    if (!info.usable)
+    {
+        out << "state                 cpu fallback (" << info.reason << ")\n";
+        return out.str();
+    }
+    out << "device                " << info.device << "\n";
+    out << "work group            " << info.workGroupX << "x" << info.workGroupY
+        << " (device max " << info.maxWorkGroup << ")\n";
+    out << "submissions           " << info.submissions
+        << "   coarse cells " << info.cells << "\n";
+    if (info.fallbacks)
+        out << "runtime fallbacks     " << info.fallbacks << " (" << info.reason << ")\n";
+    out << "host queueing/waiting " << (info.hostEnqueueNs / 1e6) << " / "
+        << (info.hostWaitNs / 1e6) << " ms (all threads)\n";
+    return out.str();
+}
+
+// ---------------------------------------------------------------------------
+// --gpu-verify: the numeric acceptance test of docs/GPU_ACCEL_PLAN.md §7.2.
+//
+// The OpenCL coarse grids are compared cell by cell against the frozen CPU
+// implementation over real chunk-sized windows: the phase-1 chain (cont grid ->
+// dilation -> masked weirdness grid) and the phase-1 ClimateCoarse grid.
+// ---------------------------------------------------------------------------
+struct GridDiff
+{
+    size_t cells = 0;
+    size_t diff = 0;
+    int firstX = 0;
+    int firstZ = 0;
+    bool any = false;
+};
+
+GridDiff compareGrids(const std::vector<uint8_t> &cpu, const std::vector<uint8_t> &gpu, int W)
+{
+    GridDiff result;
+    result.cells = std::min(cpu.size(), gpu.size());
+    for (size_t i = 0; i < result.cells; i++)
+    {
+        if ((cpu[i] != 0) == (gpu[i] != 0))
+            continue;
+        result.diff++;
+        if (!result.any)
+        {
+            result.any = true;
+            result.firstX = static_cast<int>(i % static_cast<size_t>(W));
+            result.firstZ = static_cast<int>(i / static_cast<size_t>(W));
+        }
+    }
+    return result;
+}
+
+void printGridDiff(const char *label, const GridDiff &diff)
+{
+    const double fraction = diff.cells ? static_cast<double>(diff.diff)
+                                             / static_cast<double>(diff.cells) : 0.0;
+    std::printf("%-40s cells=%-8zu diff=%-6zu (%.3e)", label, diff.cells, diff.diff, fraction);
+    if (diff.any)
+        std::printf(" first@(%d,%d)", diff.firstX, diff.firstZ);
+    std::printf("\n");
+}
+
+int runGpuVerify(const Options &options)
+{
+    Generator g;
+    setupGenerator(&g, options.mc, FORCE_OCEAN_VARIANTS);
+    applySeed(&g, DIM_OVERWORLD, static_cast<uint64_t>(options.seed));
+
+    if (!lowyd_gpu::activate(&g, true))
+    {
+        const lowyd_gpu::Info &info = lowyd_gpu::info();
+        std::printf("gpu verify: backend unavailable (%s)\n", info.reason.c_str());
+        return 1;
+    }
+
+    const int contScale = options.mode == lowyd::SEARCH_MODE_PRECISE
+        ? lowyd::PHASE1_CONT_SCALE_PRECISE : lowyd::PHASE1_CONT_SCALE_FAST;
+    const int weirdScale = options.mode == lowyd::SEARCH_MODE_PRECISE
+        ? lowyd::PHASE1_WEIRD_SCALE_PRECISE : lowyd::PHASE1_WEIRD_SCALE_FAST;
+    const int side = options.gpuVerify;
+    const int startX = options.minX - kRingOuter;
+    const int startZ = options.minZ - kRingOuter;
+
+    std::printf("gpu verify: device=%s mode=%s chunk=%d contScale=%d weirdScale=%d\n",
+                lowyd_gpu::info().device.c_str(), std::string(modeName(options.mode)).c_str(),
+                side, contScale, weirdScale);
+
+    /* G2: sustained device throughput and the latency of one submission. */
+    {
+        for (int benchSide: { 64, 256, 2048 })
+        {
+            double latencyMicros = 0.0;
+            const double rate = lowyd_gpu::benchmarkGrid(benchSide, &latencyMicros);
+            if (rate > 0.0)
+                std::printf("gpu verify: side=%-5d throughput %8.1f M cells/s, "
+                            "%.1f ns/cell, one submission %.0f us\n",
+                            benchSide, rate / 1e6, 1e9 / rate, latencyMicros);
+        }
+    }
+
+    const int contW = side / contScale;
+    const int contH = side / contScale;
+    const int weirdW = side / weirdScale;
+    const int weirdH = side / weirdScale;
+    const int dilate = 1;
+
+    GridDiff totalCont;
+    GridDiff totalWeird;
+    for (int k = 0; k < 2; k++)
+    {
+        const int cx = startX + k * side;
+        const int cz = startZ + k * side;
+
+        /* CPU reference: continentalness grid, then Chebyshev dilation, then
+         * the weirdness gate inside the dilated mask. */
+        std::vector<uint8_t> cpuCont(static_cast<size_t>(contW) * contH, 0);
+        for (int y = 0; y < contH; y++)
+        {
+            const int wz = cz + y * contScale + contScale / 2;
+            for (int x = 0; x < contW; x++)
+            {
+                const int wx = cx + x * contScale + contScale / 2;
+                cpuCont[static_cast<size_t>(y) * contW + x] =
+                    passContinentalnessPartialThr(&g.bn, wx / 4, wz / 4,
+                                                  SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD)
+                    ? 1 : 0;
+            }
+        }
+        std::vector<uint8_t> cpuMask = cpuCont;
+        for (int y = 0; y < contH; y++)
+        {
+            for (int x = 0; x < contW; x++)
+            {
+                if (!cpuCont[static_cast<size_t>(y) * contW + x])
+                    continue;
+                for (int dy = -dilate; dy <= dilate; dy++)
+                {
+                    for (int dx = -dilate; dx <= dilate; dx++)
+                    {
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || ny < 0 || nx >= contW || ny >= contH)
+                            continue;
+                        cpuMask[static_cast<size_t>(ny) * contW + nx] = 1;
+                    }
+                }
+            }
+        }
+
+        std::vector<uint8_t> cpuWeird(static_cast<size_t>(weirdW) * weirdH, 0);
+        for (int y = 0; y < weirdH; y++)
+        {
+            const int wz = cz + y * weirdScale + weirdScale / 2;
+            for (int x = 0; x < weirdW; x++)
+            {
+                const int wx = cx + x * weirdScale + weirdScale / 2;
+                const int tx = (wx - cx) / contScale;
+                const int tz = (wz - cz) / contScale;
+                if (!cpuMask[static_cast<size_t>(tz) * contW + tx])
+                    continue;
+                cpuWeird[static_cast<size_t>(y) * weirdW + x] =
+                    passCaveWeirdness(&g.bn, wx / 4, wz / 4, COARSE_SAMPLE_FLAGS) ? 1 : 0;
+            }
+        }
+
+        std::vector<uint8_t> gpuCont;
+        std::vector<uint8_t> gpuWeird;
+        if (!lowyd_gpu::evalChunk(&g, cx, cz, side, side, contScale, weirdScale,
+                                  SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD, dilate,
+                                  gpuCont, gpuWeird, nullptr))
+        {
+            std::printf("gpu verify: evalChunk failed\n");
+            lowyd_gpu::deactivate();
+            return 1;
+        }
+
+        const GridDiff contDiff = compareGrids(cpuMask, gpuCont, contW);
+        const GridDiff weirdDiff = compareGrids(cpuWeird, gpuWeird, weirdW);
+        char label[96];
+        std::snprintf(label, sizeof(label), "cont mask (dilate) chunk %d @%d,%d", k, cx, cz);
+        printGridDiff(label, contDiff);
+        std::snprintf(label, sizeof(label), "weird grid  chunk %d @%d,%d", k, cx, cz);
+        printGridDiff(label, weirdDiff);
+        totalCont.cells += contDiff.cells;
+        totalCont.diff += contDiff.diff;
+        totalWeird.cells += weirdDiff.cells;
+        totalWeird.diff += weirdDiff.diff;
+    }
+    printGridDiff("cont mask  TOTAL", totalCont);
+    printGridDiff("weird grid TOTAL", totalWeird);
+
+    /* ClimateCoarse: 512-block windows at scale 4, as phase 1 uses them. */
+    GridDiff totalClimate;
+    for (int k = 0; k < 2; k++)
+    {
+        const int cx = startX + k * 512;
+        const int cz = startZ + k * 512;
+        const int W = 512 / SearchConfig::PHASE1_CLIMATE_GRID_SCALE;
+        const int H = W;
+        std::vector<uint8_t> cpu(static_cast<size_t>(W) * H, 0);
+        for (int y = 0; y < H; y++)
+        {
+            const int wz = cz + y * 4 + 2;
+            for (int x = 0; x < W; x++)
+            {
+                const int wx = cx + x * 4 + 2;
+                cpu[static_cast<size_t>(y) * W + x] =
+                    passCoarseCaveCell(&g.bn, wx / 4, wz / 4, COARSE_SAMPLE_FLAGS) ? 1 : 0;
+            }
+        }
+        std::vector<uint8_t> gpu;
+        if (!lowyd_gpu::evalGrid(&g, cx, cz, W, H, 4, lowyd_gpu::GRID_CLIMATE,
+                                 CONT_PARTIAL_FINAL_THRESHOLD, nullptr, 0, 0, 0, 0, 0,
+                                 gpu, nullptr))
+        {
+            std::printf("gpu verify: climate evalGrid failed\n");
+            lowyd_gpu::deactivate();
+            return 1;
+        }
+        char label[96];
+        std::snprintf(label, sizeof(label), "climate grid 512 @%d,%d", cx, cz);
+        const GridDiff climateDiff = compareGrids(cpu, gpu, W);
+        printGridDiff(label, climateDiff);
+        totalClimate.cells += climateDiff.cells;
+        totalClimate.diff += climateDiff.diff;
+    }
+    printGridDiff("climate grid TOTAL", totalClimate);
+
+    lowyd_gpu::deactivate();
+    return 0;
+}
+
 } // namespace
 
 int run(int argc, char **argv)
 {
+    /* Backend default from the environment; --backend overrides it. */
+    if (const char *envBackend = std::getenv("LOWYD_BACKEND"))
+    {
+        lowyd_gpu::Backend backend = lowyd_gpu::Backend::Auto;
+        if (lowyd_gpu::parseBackend(envBackend, &backend))
+            lowyd_gpu::setBackend(backend);
+    }
+
     Options options = parseOptions(argc, argv);
 
     if (options.help)
@@ -761,6 +1049,9 @@ int run(int argc, char **argv)
 
     validateOptions(options);
 
+    if (options.gpuVerify > 0)
+        return runGpuVerify(options);
+
     lowyd::SearchParams params;
     params.seed = static_cast<uint64_t>(options.seed);
     params.startX = options.minX - kRingOuter;
@@ -787,6 +1078,7 @@ int run(int argc, char **argv)
     std::cerr << "searching seed=" << options.seed
               << " mc=" << mcDisplayName(options.mc)
               << " mode=" << modeName(options.mode)
+              << " backend=" << lowyd_gpu::backendName(lowyd_gpu::backend())
               << " area=[" << options.minX << "," << options.maxX << "]x["
               << options.minZ << "," << options.maxZ << "]"
               << " minArea=" << options.minArea
@@ -856,6 +1148,7 @@ int run(int argc, char **argv)
     {
         lowyd_bench::setEnabled(false);
         std::cerr << "\n" << formatBenchReport(static_cast<double>(elapsed.count()) / 1000.0);
+        std::cerr << formatGpuReport();
     }
     return 0;
 }

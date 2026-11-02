@@ -88,6 +88,7 @@ else()
         "${PROJECT_ROOT}/lowydripstonecavefinder.cpp"
         "${PROJECT_ROOT}/BiomeSampler.cpp"
         "${PROJECT_ROOT}/OctaveFieldCache.cpp"
+        "${PROJECT_ROOT}/GpuCoarse.cpp"
         "${LOWYD_CUBIOMES_DIR}/generator.c"
         "${LOWYD_CUBIOMES_DIR}/layers.c"
         "${LOWYD_CUBIOMES_DIR}/biomenoise.c"

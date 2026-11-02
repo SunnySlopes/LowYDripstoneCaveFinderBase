@@ -29,7 +29,8 @@ enum Stage
     STAGE_WEIRD_RING = 2,  /* phase-1 weirdness ring scan */
     STAGE_CLIMATE_COARSE = 3, /* ClimateCoarse subsearches around peaks */
     STAGE_PHASE2 = 4,      /* phase-2 precise refinement */
-    STAGE_COUNT = 5
+    STAGE_GPU = 5,         /* host wall time inside OpenCL submissions */
+    STAGE_COUNT = 6
 };
 
 inline const char *stageName(Stage stage)
@@ -41,6 +42,7 @@ inline const char *stageName(Stage stage)
     case STAGE_WEIRD_RING: return "weird ring scan";
     case STAGE_CLIMATE_COARSE: return "climate coarse";
     case STAGE_PHASE2: return "phase2 precise";
+    case STAGE_GPU: return "gpu coarse grid (host)";
     default: return "?";
     }
 }
@@ -66,6 +68,10 @@ struct Counters
     std::atomic<uint64_t> dilateWrites{0};
     /** Weirdness cells actually evaluated (N0: ns/cell tracking). */
     std::atomic<uint64_t> weirdCells{0};
+    /** Phase-1 ring candidates emitted by the max-area filter. */
+    std::atomic<uint64_t> ringCandidates{0};
+    /** Highest number of candidates one chunk/subsearch produced. */
+    std::atomic<uint64_t> ringCandidatesMax{0};
 
     Counters() { reset(); }
 
@@ -88,6 +94,8 @@ struct Counters
         phase0Samples.store(0, std::memory_order_relaxed);
         dilateWrites.store(0, std::memory_order_relaxed);
         weirdCells.store(0, std::memory_order_relaxed);
+        ringCandidates.store(0, std::memory_order_relaxed);
+        ringCandidatesMax.store(0, std::memory_order_relaxed);
     }
 };
 

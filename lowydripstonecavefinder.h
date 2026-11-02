@@ -94,6 +94,13 @@ struct SearchParams {
     int contScale = 0;  // <= 0 uses the SearchConfig default (128)
     int weirdScale = 0; // <= 0 uses the SearchConfig default (32)
     int searchMode = SEARCH_MODE_FAST;
+    /**
+     * Non-zero: the OpenCL backend may be used when its gate is satisfied (the
+     * window is large enough and a usable device exists). Zero: never touch
+     * OpenCL, always run the CPU path. Either way an unusable device is silent
+     * and the CPU path produces the same results.
+     */
+    int allowGpu = 1;
 };
 
 /** Clears pause/stop flags, progress counters and the "now" result list. */

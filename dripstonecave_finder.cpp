@@ -203,6 +203,57 @@ static inline bool contPrefilterAllows(
     return mask[(size_t) tz * maskW + tx] != 0;
 }
 
+/** OpenCL grid kind for a filter mode, or -1 when the CPU has to do it. */
+static int gpuGridMode(FilterMode mode)
+{
+    switch (mode)
+    {
+    case FilterMode::WeirdnessOnly: return (int) lowyd_gpu::GRID_WEIRD;
+    case FilterMode::ContinentalnessOnly: return (int) lowyd_gpu::GRID_CONT;
+    case FilterMode::ClimateCoarse: return (int) lowyd_gpu::GRID_CLIMATE;
+    default: return -1;
+    }
+}
+
+/**
+ * Evaluates a W x H coarse-cell grid on the GPU.
+ *
+ * Returns true and fills `cells` (W*H bytes, 1 = pass) when the device ran it.
+ * The CPU semantics the kernel reproduces are described in GpuCoarse.h; the
+ * grid is the *only* thing the device produces, so the prefix/ring/peak logic
+ * downstream is shared bit for bit with the CPU path.
+ */
+static bool gpuCoarseCells(
+    Generator *g, int startX, int startZ, int W, int H, int scale,
+    FilterMode mode, double contThreshold,
+    const std::vector<uint8_t> *mask, int maskScale, int maskW, int maskH,
+    std::vector<uint8_t> &cells)
+{
+    if (!lowyd_gpu::enabled())
+        return false;
+    const int gridMode = gpuGridMode(mode);
+    if (gridMode < 0 || scale <= 1)
+        return false;
+    if ((size_t) W * (size_t) H < 1024)
+        return false;
+
+    const uint8_t *maskData = nullptr;
+    if (mask && !mask->empty() && maskScale > 0 && maskW > 0 && maskH > 0)
+    {
+        if (mask->size() < (size_t) maskW * (size_t) maskH)
+            return false;
+        maskData = mask->data();
+    }
+
+    lowyd_bench::Scope benchScope(lowyd_bench::STAGE_GPU);
+    cells.clear();
+    return lowyd_gpu::evalGrid(g, startX, startZ, W, H, scale,
+                               (lowyd_gpu::GridMode) gridMode, contThreshold,
+                               maskData, startX, startZ, maskData ? maskScale : 0,
+                               maskData ? maskW : 0, maskData ? maskH : 0,
+                               cells, nullptr);
+}
+
 static void fillPreciseGrid(Generator *g, int startX, int startZ, int W, int H,
                             std::vector<int> &rawRiver, std::vector<int> &rawCave)
 {
@@ -242,7 +293,8 @@ std::vector<Res> findBiggestRiver(
     FilterMode mode,
     float riverWeight = 0.7f,
     const std::vector<uint8_t> *contPrefilter = nullptr,
-    int contPrefilterScale = 0) noexcept
+    int contPrefilterScale = 0,
+    const std::vector<uint8_t> *coarseCells = nullptr) noexcept
 {
     std::vector<Res> result;
     const int W = sx / scale;
@@ -283,37 +335,76 @@ std::vector<Res> findBiggestRiver(
 
     if constexpr (scale > 1)
     {
-        uint64_t weirdCells = 0;
-        for (int z = 0; z < H; z++)
+        /* The 0/1 cell grid comes from the device when it can run it: the
+         * OpenCL path replaces exactly the coarseCellValue() loop below, so
+         * everything after this block (prefix sums, ring areas, peaks) stays
+         * shared with the CPU path. */
+        std::vector<uint8_t> deviceCells;
+        const std::vector<uint8_t> *precomputed = nullptr;
+        if (coarseCells && coarseCells->size() == (size_t) W * (size_t) H)
         {
-            const int worldZ = startZ + z * scale + scale / 2;
-            for (int x = 0; x < W; x++)
+            precomputed = coarseCells;
+        } else if (mode != FilterMode::UsePrefilterMask)
+        {
+            const double gpuThreshold = mode == FilterMode::ContinentalnessOnly
+                || mode == FilterMode::ClimateCoarse
+                ? CONT_PARTIAL_FINAL_THRESHOLD : 0.0;
+            if (gpuCoarseCells(g, startX, startZ, W, H, scale, mode, gpuThreshold,
+                               contPrefilter, contPrefilterScale, preW, preH, deviceCells))
+                precomputed = &deviceCells;
+        }
+
+        uint64_t weirdCells = 0;
+        if (precomputed)
+        {
+            const uint8_t *src = precomputed->data();
+            for (int z = 0; z < H; z++)
             {
-                const int worldX = startX + x * scale + scale / 2;
-                if (mode == FilterMode::UsePrefilterMask)
+                for (int x = 0; x < W; x++)
                 {
-                    const int v = contPrefilter &&
-                        contPrefilterAllows(*contPrefilter, preW, preH,
-                                            startX, startZ, contPrefilterScale, worldX, worldZ)
-                        ? 1 : 0;
+                    const int v = src[(size_t) z * (size_t) W + (size_t) x] != 0 ? 1 : 0;
                     RAWR(x, z) = v;
                     if (v)
                         markOcc(x, z);
-                    continue;
                 }
-                if (contPrefilter &&
-                    !contPrefilterAllows(*contPrefilter, preW, preH,
-                                         startX, startZ, contPrefilterScale, worldX, worldZ))
+            }
+            /* The device evaluates the whole grid; the CPU skips masked cells. */
+            if (mode == FilterMode::WeirdnessOnly)
+                weirdCells = (uint64_t) W * (uint64_t) H;
+        }
+        else
+        {
+            for (int z = 0; z < H; z++)
+            {
+                const int worldZ = startZ + z * scale + scale / 2;
+                for (int x = 0; x < W; x++)
                 {
-                    RAWR(x, z) = 0;
-                    continue;
+                    const int worldX = startX + x * scale + scale / 2;
+                    if (mode == FilterMode::UsePrefilterMask)
+                    {
+                        const int v = contPrefilter &&
+                            contPrefilterAllows(*contPrefilter, preW, preH,
+                                                startX, startZ, contPrefilterScale, worldX, worldZ)
+                            ? 1 : 0;
+                        RAWR(x, z) = v;
+                        if (v)
+                            markOcc(x, z);
+                        continue;
+                    }
+                    if (contPrefilter &&
+                        !contPrefilterAllows(*contPrefilter, preW, preH,
+                                             startX, startZ, contPrefilterScale, worldX, worldZ))
+                    {
+                        RAWR(x, z) = 0;
+                        continue;
+                    }
+                    const int v = coarseCellValue(g, worldX, worldZ, mode);
+                    if (mode == FilterMode::WeirdnessOnly)
+                        weirdCells++;
+                    RAWR(x, z) = v;
+                    if (v)
+                        markOcc(x, z);
                 }
-                const int v = coarseCellValue(g, worldX, worldZ, mode);
-                if (mode == FilterMode::WeirdnessOnly)
-                    weirdCells++;
-                RAWR(x, z) = v;
-                if (v)
-                    markOcc(x, z);
             }
         }
         if (lowyd_bench::enabled() && weirdCells)
@@ -537,6 +628,18 @@ std::vector<Res> findBiggestRiver(
         pq.pop();
     }
 
+    if (lowyd_bench::enabled())
+    {
+        lowyd_bench::Counters &c = lowyd_bench::counters();
+        lowyd_bench::add(c.ringCandidates, (uint64_t) result.size());
+        uint64_t previous = c.ringCandidatesMax.load(std::memory_order_relaxed);
+        while ((uint64_t) result.size() > previous
+               && !c.ringCandidatesMax.compare_exchange_weak(previous,
+                                                             (uint64_t) result.size()))
+        {
+        }
+    }
+
 #undef RAWR
 #undef RAWC
 #undef ARRR
@@ -552,7 +655,118 @@ std::vector<Res> findBiggestRiver(
     return result;
 }
 
-/** phase1Pipeline: 0 = Cont+Weird joint mask (bench only); 1 = Cont mask + WeirdnessOnly@weirdScale (product). */
+/** Flat (dz, out, in) triples of getRingMask<scale>(), for the device. */
+template<int scale>
+static const std::vector<int> &ringTriples()
+{
+    static const std::vector<int> triples = [] {
+        const RingMask &mask = getRingMask<scale>();
+        std::vector<int> flat;
+        flat.reserve(mask.rows.size() * 3);
+        for (const auto &row: mask.rows)
+        {
+            flat.push_back(row.dz);
+            flat.push_back(row.out);
+            flat.push_back(row.in);
+        }
+        return flat;
+    }();
+    return triples;
+}
+
+/** Fills the (constant) ring geometry of a spec. */
+template<int scale>
+static void fillRingSpec(lowyd_gpu::CoarseSpec &spec)
+{
+    spec.ring = ringTriples<scale>().data();
+    spec.ringRows = (int) getRingMask<scale>().rows.size();
+    spec.ringOut = getRingMask<scale>().R_out;
+}
+
+/** Phase-1 chunks one OpenCL submission covers. */
+static constexpr int kGpuChunkBatch = 8;
+
+/** LOWYD_COARSE_DEBUG=1: per chunk, compare the device candidate list with the
+ *  CPU ring scan and print the first differences (regression aid). */
+static bool coarseDebugEnabled()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("LOWYD_COARSE_DEBUG");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+static void reportCoarseDiff(const std::vector<Res> &device, const std::vector<Res> &cpu,
+                             int csx, int csz)
+{
+    static std::atomic<int> reported{ 0 };
+    static std::atomic<uint64_t> compared{ 0 };
+    static std::atomic<uint64_t> mismatched{ 0 };
+    compared.fetch_add(1);
+    bool same = device.size() == cpu.size();
+    if (same)
+    {
+        for (size_t i = 0; i < device.size(); i++)
+        {
+            if (device[i].point.x != cpu[i].point.x || device[i].point.y != cpu[i].point.y
+                || device[i].area != cpu[i].area)
+            {
+                same = false;
+                break;
+            }
+        }
+    }
+    if (same)
+        return;
+    mismatched.fetch_add(1);
+    if (reported.fetch_add(1) >= 6)
+        return;
+    std::fprintf(stderr, "[coarse] chunk %d,%d device=%zu cpu=%zu (compared %llu, mismatched %llu)\n",
+                 csx, csz, device.size(), cpu.size(),
+                 (unsigned long long) compared.load(), (unsigned long long) mismatched.load());
+    const size_t limit = std::min<size_t>(std::max(device.size(), cpu.size()), 6);
+    for (size_t i = 0; i < limit; i++)
+    {
+        const bool differ = i >= device.size() || i >= cpu.size()
+            || device[i].point.x != cpu[i].point.x || device[i].point.y != cpu[i].point.y
+            || device[i].area != cpu[i].area;
+        std::fprintf(stderr, "[coarse]  %s #%zu device=(%d,%d,%d) cpu=(%d,%d,%d)\n",
+                     differ ? "!" : " ", i,
+                     i < device.size() ? device[i].point.x : 0,
+                     i < device.size() ? device[i].point.y : 0,
+                     i < device.size() ? device[i].area : 0,
+                     i < cpu.size() ? cpu[i].point.x : 0,
+                     i < cpu.size() ? cpu[i].point.y : 0,
+                     i < cpu.size() ? cpu[i].area : 0);
+    }
+}
+
+/** Emission order of findBiggestRiver()'s priority queue. */
+static void sortCoarseCandidates(std::vector<Res> &list)
+{
+    std::ranges::sort(list, [](const Res &a, const Res &b) {
+        if (a.area != b.area) return a.area > b.area;
+        if (a.point.x != b.point.x) return a.point.x < b.point.x;
+        return a.point.y < b.point.y;
+    });
+}
+
+/**
+ * Phase-1 driver.
+ *
+ * The pipeline is unchanged semantically; what changed is where the work runs
+ * and the submission granularity:
+ *
+ *   device, one submission per batch of up to kGpuChunkBatch chunks
+ *     cont grid -> dilation -> tile compaction -> weirdness grid
+ *     -> 2D prefix sums -> annular sums -> candidate list
+ *   CPU
+ *     per-tile best, ClimateCoarse subsearches, overlap filtering
+ *
+ * When the device is not available (or refuses a batch) every chunk of that
+ * batch runs the original CPU path, so the semantics stay identical.
+ */
 void findBiggestRiverParallelPool(
     ThreadSafeResults<Res> &globalResults,
     Generator *g,
@@ -566,7 +780,6 @@ void findBiggestRiverParallelPool(
     int weirdnessGridScale = -1
 )
 {
-    ThreadPool pool(numThreads);
     const int chunkSize = 4096 * 2;
     const int tile = SearchConfig::CANDIDATE_TILE_BLOCKS;
     const int overlap = tile;
@@ -581,96 +794,260 @@ void findBiggestRiverParallelPool(
         : SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE;
     (void) phase1Pipeline; /* product always Cont+WeirdnessOnly; retained for bench CLI */
     std::atomic<int> completedChunks{0};
-    int totalChunks = 0;
+
+    /* Grid scale of the weirdness scan: findBiggestRiver<16> or <32>. */
+    const int gridScale = weirdScale <= 16 ? 16 : SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE;
+
+    struct Rect
+    {
+        int x, z, w, h;
+    };
+    std::vector<Rect> rects;
+    for (int x = 0; x < sx; x += step)
+    {
+        for (int z = 0; z < sz; z += step)
+        {
+            const int currentSx = std::min(chunkSize, sx - x);
+            const int currentSz = std::min(chunkSize, sz - z);
+            if (currentSx >= tile && currentSz >= tile)
+                rects.push_back({ x, z, currentSx, currentSz });
+        }
+    }
+    const int totalChunks = static_cast<int>(rects.size());
+
+    if (progress)
+        progress->total.store(totalChunks);
+
+    /* Batching only groups consecutive chunks of identical size (the last
+     * column/row of a window is smaller). */
+    struct Batch
+    {
+        int first;
+        int count;
+    };
+    const bool gpu = lowyd_gpu::enabled();
+    std::vector<Batch> batches;
+    for (int i = 0; i < totalChunks;)
+    {
+        int n = 1;
+        if (gpu)
+        {
+            while (n < kGpuChunkBatch && i + n < totalChunks
+                   && rects[i + n].w == rects[i].w && rects[i + n].h == rects[i].h)
+                n++;
+        }
+        batches.push_back({ i, n });
+        i += n;
+    }
+
+    const uint64_t seedVal = g->seed;
+    const int mcVer = g->mc > 0 ? g->mc : MC_26_1;
 
 #ifdef LOWYD_VERBOSE
     auto startTime = std::chrono::high_resolution_clock::now();
 #endif
 
-    for (int x = 0; x < sx; x += step)
+    /* Declared last so that it joins before any captured object is destroyed. */
+    ThreadPool pool(numThreads);
+    for (const Batch &batch: batches)
     {
-        for (int z = 0; z < sz; z += step)
-        {
-            int currentSx = std::min(chunkSize, sx - x);
-            int currentSz = std::min(chunkSize, sz - z);
-            if (currentSx >= tile && currentSz >= tile)
-                totalChunks++;
-        }
-    }
-
-    if (progress)
-        progress->total.store(totalChunks);
-
-    const uint64_t seedVal = g->seed;
-    const int mcVer = g->mc > 0 ? g->mc : MC_26_1;
-
-    for (int x = 0; x < sx; x += step)
-    {
-        for (int z = 0; z < sz; z += step)
-        {
-            if (progress && progress->try_stop.load())
-                return;
-
-            int currentSx = std::min(chunkSize, sx - x);
-            int currentSz = std::min(chunkSize, sz - z);
-
-            if (currentSx >= tile && currentSz >= tile)
+        pool.enqueue([&, batch, totalChunks, seedVal, contScale, weirdScale, gridScale, mcVer]() {
+            if (progress)
             {
-                pool.enqueue([&, x, z, currentSx, currentSz, seedVal, contScale, weirdScale, mcVer]() {
-                    if (progress)
-                    {
-                        if (progress->try_stop.load()) return;
-                        while (progress->try_pause.load())
-                        {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                            if (progress->try_stop.load()) return;
-                        }
-                        progress->chunkInRunning.fetch_add(1);
-                    }
+                if (progress->try_stop.load()) return;
+                while (progress->try_pause.load())
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (progress->try_stop.load()) return;
+                }
+                progress->chunkInRunning.fetch_add(batch.count);
+            }
 
-                    thread_local Generator tlsG;
-                    thread_local bool tlsInited = false;
-                    thread_local int tlsMc = -1;
-                    thread_local uint64_t tlsSeed = ~0ull;
-                    if (!tlsInited || tlsMc != mcVer)
-                    {
-                        setupGenerator(&tlsG, mcVer, FORCE_OCEAN_VARIANTS);
-                        tlsInited = true;
-                        tlsMc = mcVer;
-                        tlsSeed = ~0ull;
-                    }
-                    if (tlsSeed != seedVal)
-                    {
-                        applySeed(&tlsG, DIM_OVERWORLD, seedVal);
-                        tlsSeed = seedVal;
-                    }
+            thread_local Generator tlsG;
+            thread_local bool tlsInited = false;
+            thread_local int tlsMc = -1;
+            thread_local uint64_t tlsSeed = ~0ull;
+            if (!tlsInited || tlsMc != mcVer)
+            {
+                setupGenerator(&tlsG, mcVer, FORCE_OCEAN_VARIANTS);
+                tlsInited = true;
+                tlsMc = mcVer;
+                tlsSeed = ~0ull;
+            }
+            if (tlsSeed != seedVal)
+            {
+                applySeed(&tlsG, DIM_OVERWORLD, seedVal);
+                tlsSeed = seedVal;
+            }
 
-                    const int csx = startX + x;
-                    const int csz = startZ + z;
-
-                    auto finishChunk = [&]() {
-                        int completed = completedChunks.fetch_add(1) + 1;
-                        if (progress)
-                        {
-                            progress->current.store(completed);
-                            progress->chunkInRunning.fetch_sub(1);
-                        }
+            auto finishChunk = [&]() {
+                int completed = completedChunks.fetch_add(1) + 1;
+                if (progress)
+                {
+                    progress->current.store(completed);
+                    progress->chunkInRunning.fetch_sub(1);
+                }
 #ifdef LOWYD_VERBOSE
-                        if (completed % 500 == 0)
-                        {
-                            auto currentTime = std::chrono::high_resolution_clock::now();
-                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                currentTime - startTime).count();
-                            double speed = static_cast<double>(completed) / elapsed * 1000;
-                            std::cout << "Progress: " << completed << "/" << totalChunks
-                                    << " (" << int(completed * 100.0 / totalChunks)
-                                    << "%) - " << speed << " chunks/sec\n";
-                        }
+                if (completed % 500 == 0)
+                {
+                    auto currentTime = std::chrono::high_resolution_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        currentTime - startTime).count();
+                    double speed = static_cast<double>(completed) / elapsed * 1000;
+                    std::cout << "Progress: " << completed << "/" << totalChunks
+                            << " (" << int(completed * 100.0 / totalChunks)
+                            << "%) - " << speed << " chunks/sec\n";
+                }
 #endif
-                    };
+            };
 
-                    /* Cont prefilter + WeirdnessOnly ring. Keep only product scales 16/32
-                     * so the fast (32) path stays as lean as the pre-UI Cont@128+Weird@32 build. */
+            /* ---------------------------------------------------------------
+             * Device: candidate lists for the whole batch, one flush.
+             * ------------------------------------------------------------- */
+            std::vector<std::vector<lowyd_gpu::Candidate>> batchCandidates;
+            bool batchOnDevice = false;
+            if (lowyd_gpu::enabled())
+            {
+                lowyd_gpu::CoarseSpec spec{};
+                spec.contScale = contScale;
+                spec.gridScale = gridScale;
+                spec.minArea = minArea;
+                spec.f = 0.8;
+                spec.contThreshold = SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD;
+                spec.dilate = SearchConfig::PHASE1_CONT_PREFILTER_DILATE;
+                spec.climate = false;
+                if (gridScale <= 16)
+                    fillRingSpec<16>(spec);
+                else
+                    fillRingSpec<SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE>(spec);
+
+                std::vector<lowyd_gpu::CoarseSpec> specs((size_t) batch.count, spec);
+                for (int k = 0; k < batch.count; k++)
+                {
+                    const Rect &rect = rects[batch.first + k];
+                    specs[(size_t) k].startX = startX + rect.x;
+                    specs[(size_t) k].startZ = startZ + rect.z;
+                    specs[(size_t) k].chunkW = rect.w;
+                    specs[(size_t) k].chunkH = rect.h;
+                }
+                batchCandidates.resize((size_t) batch.count);
+                lowyd_bench::Scope benchGpu(lowyd_bench::STAGE_GPU);
+                batchOnDevice = lowyd_gpu::evalChunkBatch(&tlsG, specs.data(), batch.count,
+                                                          batchCandidates.data(), nullptr);
+            }
+
+            for (int k = 0; k < batch.count; k++)
+            {
+                if (progress && progress->try_stop.load())
+                    return;
+
+                const Rect &rect = rects[batch.first + k];
+                const int csx = startX + rect.x;
+                const int csz = startZ + rect.z;
+                const int currentSx = rect.w;
+                const int currentSz = rect.h;
+
+                if (lowyd_bench::enabled())
+                {
+                    lowyd_bench::Counters &bench = lowyd_bench::counters();
+                    lowyd_bench::add(bench.chunks, 1);
+                    /* C2/C1 diagnostic: does this window land on the A-table lattice? */
+                    const OctaveACache *cache = getActiveOctaveACache();
+                    if (cache && cache->ready && contScale > 0)
+                    {
+                        const int nx0 = (csx + contScale / 2) / 4;
+                        const int nz0 = (csz + contScale / 2) / 4;
+                        if (probeClimate(cache->contA[0], nx0, nz0).onLattice)
+                            lowyd_bench::add(bench.latticeChunks, 1);
+                    }
+                }
+
+                std::vector<Res> blockResultsCoarse;
+                if (batchOnDevice)
+                {
+                    const std::vector<lowyd_gpu::Candidate> &list = batchCandidates[(size_t) k];
+                    blockResultsCoarse.reserve(list.size());
+                    for (const auto &candidate: list)
+                        blockResultsCoarse.emplace_back(Point{ candidate.x, candidate.z },
+                                                        candidate.area, 0, 0);
+                    sortCoarseCandidates(blockResultsCoarse);
+                    if (lowyd_bench::enabled())
+                    {
+                        lowyd_bench::add(lowyd_bench::counters().weirdCells,
+                                         (uint64_t) ((size_t) (currentSx / gridScale) * (size_t) (currentSz / gridScale)));
+                        lowyd_bench::add(lowyd_bench::counters().ringCandidates,
+                                         (uint64_t) blockResultsCoarse.size());
+                    }
+                    if (coarseDebugEnabled())
+                    {
+                        /* Regression aid: the CPU ring scan for the same chunk. */
+                        std::vector<uint8_t> debugMask = buildDilatedContPrefilterMask(
+                            &tlsG, csx, csz, currentSx, currentSz, contScale,
+                            SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD,
+                            SearchConfig::PHASE1_CONT_PREFILTER_DILATE);
+                        std::vector<Res> cpuList;
+                        if (gridScale <= 16)
+                            cpuList = findBiggestRiver<16>(&tlsG, csx, csz, currentSx,
+                                                           currentSz, minArea, 0.8,
+                                                           FilterMode::WeirdnessOnly, 0.7f,
+                                                           &debugMask, contScale);
+                        else
+                            cpuList = findBiggestRiver<SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE>(
+                                &tlsG, csx, csz, currentSx, currentSz, minArea, 0.8,
+                                FilterMode::WeirdnessOnly, 0.7f, &debugMask, contScale);
+                        reportCoarseDiff(blockResultsCoarse, cpuList, csx, csz);
+                        if (blockResultsCoarse.size() != cpuList.size()
+                            || (!blockResultsCoarse.empty()
+                                && blockResultsCoarse[0].area != cpuList[0].area))
+                        {
+                            /* Also compare the 0/1 cell grid the ring runs on. */
+                            const int W = currentSx / gridScale;
+                            const int H = currentSz / gridScale;
+                            const int cW = currentSx / contScale;
+                            std::vector<uint8_t> gpuMask;
+                            std::vector<uint8_t> gpuGrid;
+                            if (lowyd_gpu::evalChunk(&tlsG, csx, csz, currentSx, currentSz,
+                                                     contScale, gridScale,
+                                                     SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD,
+                                                     SearchConfig::PHASE1_CONT_PREFILTER_DILATE,
+                                                     gpuMask, gpuGrid, nullptr)
+                                && gpuGrid.size() == (size_t) W * H)
+                            {
+                                size_t gridDiff = 0;
+                                int firstX = -1;
+                                int firstZ = -1;
+                                for (int z = 0; z < H; z++)
+                                {
+                                    for (int x = 0; x < W; x++)
+                                    {
+                                        const int bx = csx + x * gridScale + gridScale / 2;
+                                        const int bz = csz + z * gridScale + gridScale / 2;
+                                        const int tx = (bx - csx) / contScale;
+                                        const int tz = (bz - csz) / contScale;
+                                        const bool allow = tx >= 0 && tz >= 0 && tx < cW
+                                            && debugMask[(size_t) tz * cW + tx] != 0;
+                                        const int cpuValue = allow && passCaveWeirdness(
+                                            &tlsG.bn, bx / 4, bz / 4, COARSE_SAMPLE_FLAGS) ? 1 : 0;
+                                        if (cpuValue != (int) gpuGrid[(size_t) z * W + x])
+                                        {
+                                            if (!gridDiff)
+                                            {
+                                                firstX = x;
+                                                firstZ = z;
+                                            }
+                                            gridDiff++;
+                                        }
+                                    }
+                                }
+                                std::fprintf(stderr, "[coarse]   grid diff=%zu first=(%d,%d)\n",
+                                             gridDiff, firstX, firstZ);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    /* CPU path: cont mask + full weirdness ring scan. */
                     std::vector<uint8_t> contMask;
                     {
                         lowyd_bench::Scope benchScope(lowyd_bench::STAGE_CONT_MASK);
@@ -683,31 +1060,19 @@ void findBiggestRiverParallelPool(
                     if (lowyd_bench::enabled())
                     {
                         lowyd_bench::Counters &bench = lowyd_bench::counters();
-                        lowyd_bench::add(bench.chunks, 1);
                         lowyd_bench::add(bench.contTiles, (uint64_t) contMask.size());
                         lowyd_bench::add(bench.contTilesPass, (uint64_t) std::count_if(
                             contMask.begin(), contMask.end(), [](uint8_t v) { return v != 0; }));
-                        /* C2/C1 diagnostic: does this window land on the A-table lattice? */
-                        const OctaveACache *cache = getActiveOctaveACache();
-                        if (cache && cache->ready && contScale > 0)
-                        {
-                            const int nx0 = (csx + contScale / 2) / 4;
-                            const int nz0 = (csz + contScale / 2) / 4;
-                            if (probeClimate(cache->contA[0], nx0, nz0).onLattice)
-                                lowyd_bench::add(bench.latticeChunks, 1);
-                        }
                     }
                     if (std::none_of(contMask.begin(), contMask.end(),
                                      [](uint8_t v) { return v != 0; }))
                     {
                         finishChunk();
-                        return;
+                        continue;
                     }
-
-                    std::vector<Res> blockResultsCoarse;
                     {
                         lowyd_bench::Scope benchScope(lowyd_bench::STAGE_WEIRD_RING);
-                        if (weirdScale <= 16)
+                        if (gridScale <= 16)
                         {
                             blockResultsCoarse = findBiggestRiver<16>(
                                 &tlsG, csx, csz, currentSx, currentSz,
@@ -716,90 +1081,116 @@ void findBiggestRiverParallelPool(
                         }
                         else
                         {
-                            blockResultsCoarse = findBiggestRiver<SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE>(
-                                &tlsG, csx, csz, currentSx, currentSz,
-                                minArea, 0.8, FilterMode::WeirdnessOnly,
-                                0.7f, &contMask, contScale);
+                            blockResultsCoarse =
+                                findBiggestRiver<SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE>(
+                                    &tlsG, csx, csz, currentSx, currentSz,
+                                    minArea, 0.8, FilterMode::WeirdnessOnly,
+                                    0.7f, &contMask, contScale);
                         }
                     }
+                }
 
-                    const int bx = currentSx / tile + 2;
-                    const int bz = currentSz / tile + 2;
-                    std::vector<Res> flags((size_t) bx * bz);
-                    for (const auto &it: blockResultsCoarse)
+                const int bx = currentSx / tile + 2;
+                const int bz = currentSz / tile + 2;
+                std::vector<Res> flags((size_t) bx * bz);
+                for (const auto &it: blockResultsCoarse)
+                {
+                    int x2 = (it.point.x - csx) / tile;
+                    int z2 = (it.point.y - csz) / tile;
+                    if (x2 >= 0 && x2 < bx && z2 >= 0 && z2 < bz)
                     {
-                        int x2 = (it.point.x - csx) / tile;
-                        int z2 = (it.point.y - csz) / tile;
-                        if (x2 >= 0 && x2 < bx && z2 >= 0 && z2 < bz)
-                        {
-                            auto &itf = flags[(size_t) x2 + (size_t) bx * z2];
-                            if (itf.area < it.area) itf = it;
-                        }
+                        auto &itf = flags[(size_t) x2 + (size_t) bx * z2];
+                        if (itf.area < it.area) itf = it;
                     }
+                }
 
-                    std::vector<Res> pqX16;
-                    for (auto &kv: flags)
-                        if (kv.area > 0) pqX16.push_back(kv);
-                    std::ranges::sort(pqX16, [](const Res &a, const Res &b) { return a.area > b.area; });
+                std::vector<Res> pqX16;
+                for (auto &kv: flags)
+                    if (kv.area > 0) pqX16.push_back(kv);
+                std::ranges::sort(pqX16, [](const Res &a, const Res &b) { return a.area > b.area; });
 
-                    std::unordered_map<uint64_t, Res> blockResultsX4;
-                    int max = 0;
-                    for (auto &res: pqX16)
+                std::unordered_map<uint64_t, Res> blockResultsX4;
+                int max = 0;
+                for (auto &res: pqX16)
+                {
+                    std::vector<Res> subResults;
                     {
-                        std::vector<Res> subResults;
+                        lowyd_bench::Scope benchScope(lowyd_bench::STAGE_CLIMATE_COARSE);
+                        bool found = false;
+                        if (lowyd_gpu::enabled())
                         {
-                            lowyd_bench::Scope benchScope(lowyd_bench::STAGE_CLIMATE_COARSE);
+                            lowyd_gpu::CoarseSpec spec{};
+                            spec.startX = res.point.x - subR;
+                            spec.startZ = res.point.y - subR;
+                            spec.chunkW = subSz;
+                            spec.chunkH = subSz;
+                            spec.contScale = SearchConfig::PHASE1_CLIMATE_GRID_SCALE;
+                            spec.gridScale = SearchConfig::PHASE1_CLIMATE_GRID_SCALE;
+                            spec.minArea = minArea;
+                            spec.f = 1.0;
+                            spec.contThreshold = CONT_PARTIAL_FINAL_THRESHOLD;
+                            spec.climate = true;
+                            fillRingSpec<SearchConfig::PHASE1_CLIMATE_GRID_SCALE>(spec);
+                            lowyd_gpu::Candidate candidate;
+                            if (lowyd_gpu::evalClimate(&tlsG, spec, &candidate, nullptr))
+                            {
+                                found = true;
+                                if (candidate.area > 0)
+                                {
+                                    subResults.emplace_back(
+                                        Point{ candidate.x, candidate.z }, candidate.area, 0, 0);
+                                }
+                            }
+                        }
+                        if (!found)
+                        {
                             subResults = findBiggestRiver<SearchConfig::PHASE1_CLIMATE_GRID_SCALE>(
                                 &tlsG,
                                 res.point.x - subR, res.point.y - subR,
                                 subSz, subSz,
                                 minArea, 1.0, FilterMode::ClimateCoarse);
-                            if (lowyd_bench::enabled())
-                                lowyd_bench::add(lowyd_bench::counters().coarseSubsearches, 1);
                         }
-
-                        if (subResults.empty()) break;
-                        if (subResults[0].area < max * 0.9) break;
-
-                        auto &r = subResults[0];
-                        uint64_t key = ((uint64_t) (uint32_t) r.point.x << 32) | (uint32_t) r.point.y;
-                        auto it = blockResultsX4.find(key);
-                        if (it == blockResultsX4.end())
-                            blockResultsX4.emplace(key, r);
-                        else if (it->second.area < r.area)
-                            it->second = r;
-
-                        if (subResults[0].area > max) max = subResults[0].area;
+                        if (lowyd_bench::enabled())
+                            lowyd_bench::add(lowyd_bench::counters().coarseSubsearches, 1);
                     }
 
-                    std::vector<Res> filteredResults;
-                    for (const auto &kv: blockResultsX4)
+                    if (subResults.empty()) break;
+                    if (subResults[0].area < max * 0.9) break;
+
+                    auto &r = subResults[0];
+                    uint64_t key = ((uint64_t) (uint32_t) r.point.x << 32) | (uint32_t) r.point.y;
+                    auto it = blockResultsX4.find(key);
+                    if (it == blockResultsX4.end())
+                        blockResultsX4.emplace(key, r);
+                    else if (it->second.area < r.area)
+                        it->second = r;
+
+                    if (subResults[0].area > max) max = subResults[0].area;
+                }
+
+                std::vector<Res> filteredResults;
+                for (const auto &kv: blockResultsX4)
+                {
+                    const auto &result = kv.second;
+                    int relX = result.point.x - csx;
+                    int relZ = result.point.y - csz;
+                    if (relX > overlap / 2 && relX < currentSx - overlap / 2 &&
+                        relZ > overlap / 2 && relZ < currentSz - overlap / 2 &&
+                        result.area > 0)
                     {
-                        const auto &result = kv.second;
-                        int relX = result.point.x - csx;
-                        int relZ = result.point.y - csz;
-                        if (relX > overlap / 2 && relX < currentSx - overlap / 2 &&
-                            relZ > overlap / 2 && relZ < currentSz - overlap / 2 &&
-                            result.area > 0)
-                        {
-                            filteredResults.push_back(result);
-                        }
+                        filteredResults.push_back(result);
                     }
-                    std::ranges::sort(filteredResults, [](const Res &a, const Res &b) { return a.area > b.area; });
-                    if (!filteredResults.empty())
-                        globalResults.addResults(filteredResults);
+                }
+                std::ranges::sort(filteredResults, [](const Res &a, const Res &b) { return a.area > b.area; });
+                if (!filteredResults.empty())
+                    globalResults.addResults(filteredResults);
 
-                    finishChunk();
-                });
+                finishChunk();
             }
-        }
+        });
     }
-
-#ifdef LOWYD_VERBOSE
-    std::cout << "Submitted " << totalChunks << " chunks [Cont@" << contScale
-              << "+Weird@" << weirdScale << "]\n";
-#endif
 }
+
 
 #if defined(CONT_PREFILTER_BENCH) && defined(LOWYD_VERBOSE)
 
@@ -1041,7 +1432,7 @@ int main(int argc, char **argv)
 
     if (cmpWeird)
     {
-        /* Cont@128 + WeirdnessOnly@{16,32,64,128} + Climate@4; oracle = Weird@16 final ≥70% results. */
+        /* Cont@128 + WeirdnessOnly@{16,32,64,128} + Climate@4; oracle = Weird@16 final �?0% results. */
         const int weirdScales[] = {16, 32, 64, 128};
         struct Run {
             int weird;
@@ -1052,7 +1443,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < 4; i++)
         {
             runs[i].weird = weirdScales[i];
-            std::printf("Running Cont@128 + WeirdnessOnly@%d + Climate@4 (final ≥70%%)...\n",
+            std::printf("Running Cont@128 + WeirdnessOnly@%d + Climate@4 (final �?0%%)...\n",
                         runs[i].weird);
             runs[i].peaks = runPhase1(&g, startX, startZ, sx, sz, minArea, threads, 128,
                                       nullptr, &runs[i].ms, /*pipeline=*/1, runs[i].weird);
@@ -1061,7 +1452,7 @@ int main(int argc, char **argv)
         }
 
         const auto ref = peakTiles(runs[0].peaks, tile);
-        std::printf("\n=== Final ≥70%% results: Weird@16 oracle vs @32/@64/@128 (half=%d, tile=%d) ===\n",
+        std::printf("\n=== Final �?0%% results: Weird@16 oracle vs @32/@64/@128 (half=%d, tile=%d) ===\n",
                     half, tile);
         std::printf("oracle Weird@16: %zu final peak-tiles  time=%.1fms\n",
                     ref.size(), runs[0].ms);

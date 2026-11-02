@@ -1,4 +1,4 @@
-﻿//
+//
 // LowYDripstoneCaveFinderBase search engine.
 //
 // This translation unit owns the whole native search pipeline that used to
@@ -49,6 +49,7 @@
 #include "BiomeSampler.h"
 #include "SearchConfig.h"
 #include "OctaveFieldCache.h"
+#include "GpuCoarse.h"
 
 namespace lowyd {
 
@@ -56,6 +57,27 @@ namespace lowyd {
 #include "LargePitSearch.cpp"
 
 namespace {
+
+/**
+ * The GPU backend is only offered for windows the plan calls "large"
+ * (user side >= 2,000,001 blocks). Below that the CPU path is faster than the
+ * OpenCL submission overhead, and the plan forbids even probing the device.
+ *
+ * Measured on a 24-core i9 + RTX 4080 (docs/GPU_ACCEL_RESULTS.md): the device
+ * wins when the window is big enough to amortise the probe and the caller does
+ * not already run 16+ worker threads, so "auto" also enables it for
+ * >= 524,288-block windows when at most 12 threads are used (1.5x at 8
+ * threads, 1.04x at 16, 0.88x at 32).
+ */
+constexpr long long kGpuMinUserSide = 2000001LL;
+constexpr long long kGpuThreadedUserSide = 524288LL;
+constexpr int kGpuMaxThreads = 12;
+
+/** Ends a search's GPU section on every return path. */
+struct GpuSession
+{
+    ~GpuSession() { lowyd_gpu::deactivate(); }
+};
 
 std::mutex g_searchMutex;
 Progress g_progress{};
@@ -396,6 +418,26 @@ std::vector<Hit> search(const SearchParams &params)
             && userW * userH >= SearchConfig::PHASE0_MIN_SIDE_BLOCKS * SearchConfig::PHASE0_MIN_SIDE_BLOCKS);
 
     OctaveACache octaveCache;
+
+    /* GPU backend for the phase-1 coarse stages (docs/GPU_ACCEL_PLAN.md §5).
+     * Below the gate the device is never probed and OpenCL is never loaded. */
+    GpuSession gpuSession;
+    {
+        /* params.allowGpu is the GUI's "allow GPU" checkbox: when it is off the
+         * device is never probed. On the CPU, or when the gate does not pass, or
+         * when no usable device exists, the search silently uses the CPU path. */
+        const lowyd_gpu::Backend requested = params.allowGpu
+            ? lowyd_gpu::backend()
+            : lowyd_gpu::Backend::Cpu;
+        bool allowGpu = requested == lowyd_gpu::Backend::Gpu;
+        if (!allowGpu && requested == lowyd_gpu::Backend::Auto)
+        {
+            allowGpu = (userW >= kGpuMinUserSide && userH >= kGpuMinUserSide)
+                || (threads <= kGpuMaxThreads
+                    && userW >= kGpuThreadedUserSide && userH >= kGpuThreadedUserSide);
+        }
+        lowyd_gpu::activate(&g, allowGpu);
+    }
 
     try
     {

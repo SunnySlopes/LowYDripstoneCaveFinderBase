@@ -52,6 +52,7 @@ $CppSources = @(
     "lowydripstonecavefinder.cpp",
     "BiomeSampler.cpp",
     "OctaveFieldCache.cpp",
+    "GpuCoarse.cpp",
     "lowydripstonecavefinder_cli.cpp"
 )
 
