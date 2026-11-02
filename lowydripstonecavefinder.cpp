@@ -1,4 +1,4 @@
-//
+﻿//
 // LowYDripstoneCaveFinderBase search engine.
 //
 // This translation unit owns the whole native search pipeline that used to
@@ -15,6 +15,7 @@
 #include "cubiomes/biomes.h"
 #include "cubiomes/generator.h"
 #include "cubiomes/util.h"
+#include "PerlinTable.h"
 
 #include <algorithm>
 #include <atomic>
@@ -44,6 +45,7 @@
 // (ThreadSafeResults, BiomeSampler, OctaveACache, SearchConfig) stay at global
 // scope, matching the separately compiled BiomeSampler.cpp / OctaveFieldCache.cpp.
 #include "Thread.h"
+#include "Bench.h"
 #include "BiomeSampler.h"
 #include "SearchConfig.h"
 #include "OctaveFieldCache.h"
@@ -373,7 +375,19 @@ std::vector<Hit> search(const SearchParams &params)
         return finish(std::move(finallyResults));
     }
 
-    /* Phase 0: Cont/Ridge A period tables for large searches. */
+    /* Phase 0: Cont/Ridge A period tables for large searches.
+     *
+     * Any phase-1 scale can be served by the tables: the lattice check in
+     * sampleContOctA()/sampleWeirdnessCached() decides per sample whether the
+     * tables apply, so precise mode (Cont@32 + Weird@16) keeps its cache too.
+     * A table build that fails is a slowdown, not a failed search. */
+    int contSc = params.contScale > 0 ? params.contScale : SearchConfig::PHASE1_CONT_PREFILTER_SCALE;
+    int weirdSc = params.weirdScale > 0 ? params.weirdScale : SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE;
+    if (weirdSc <= 0)
+        weirdSc = SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE;
+    if (contSc <= 0 || contSc % weirdSc != 0)
+        contSc = weirdSc;
+
     const long long userW = (long long) width - 2LL * RING_OUTER;
     const long long userH = (long long) height - 2LL * RING_OUTER;
     const bool wantPhase0 =
@@ -382,7 +396,6 @@ std::vector<Hit> search(const SearchParams &params)
             && userW * userH >= SearchConfig::PHASE0_MIN_SIDE_BLOCKS * SearchConfig::PHASE0_MIN_SIDE_BLOCKS);
 
     OctaveACache octaveCache;
-    setActiveOctaveACache(nullptr);
 
     try
     {
@@ -390,24 +403,27 @@ std::vector<Hit> search(const SearchParams &params)
         {
             g_progress.phase1.store(0);
             g_progress.chunkInRunning.store(0);
-            const int contSc = (params.contScale > 0) ? params.contScale : SearchConfig::PHASE1_CONT_PREFILTER_SCALE;
-            const int weirdSc = (params.weirdScale > 0) ? params.weirdScale : SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE;
-            if (!buildOctaveACache(&octaveCache, &g.bn, contSc, weirdSc, threads,
-                                   &g_progress.current, &g_progress.total,
-                                   &g_progress.try_pause, &g_progress.try_stop))
+
+            /* A failed/short table build is a slowdown, never a failed search:
+             * keep the cache inactive and fall back to live octave sampling. */
+            bool built = false;
+            try
             {
-                setActiveOctaveACache(nullptr);
-                if (g_progress.try_stop.load())
-                {
-                    resetProgressState();
-                    return {};
-                }
-                /* Build failed without stop: continue without cache. */
+                lowyd_bench::Scope benchScope(lowyd_bench::STAGE_PHASE0);
+                built = buildOctaveACache(&octaveCache, &g.bn, contSc, weirdSc, threads,
+                                          &g_progress.current, &g_progress.total,
+                                          &g_progress.try_pause, &g_progress.try_stop);
             }
-            else
+            catch (const std::bad_alloc &)
             {
+                built = false;
+            }
+
+            if (built)
                 setActiveOctaveACache(&octaveCache);
-            }
+            else
+                setActiveOctaveACache(nullptr);
+
             if (g_progress.try_stop.load())
             {
                 setActiveOctaveACache(nullptr);
@@ -415,27 +431,18 @@ std::vector<Hit> search(const SearchParams &params)
                 return {};
             }
         }
+        else
+        {
+            setActiveOctaveACache(nullptr);
+        }
 
         g_progress.phase1.store(1);
         g_progress.current.store(0);
         g_progress.total.store(0);
         g_progress.chunkInRunning.store(0);
 
-        /* cont/weird <=0 -> SearchConfig defaults (Cont@128 + Weird@32). */
-        if (params.contScale <= 0 && params.weirdScale <= 0)
-        {
-            findBiggestRiverParallelPool(g_results, &g, startX, startZ, width, height, params.minArea,
-                                         &g_progress, threads);
-        }
-        else
-        {
-            int cont = params.contScale > 0 ? params.contScale : SearchConfig::PHASE1_CONT_PREFILTER_SCALE;
-            int weird = params.weirdScale > 0 ? params.weirdScale : SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE;
-            if (cont % weird != 0)
-                cont = weird;
-            findBiggestRiverParallelPool(g_results, &g, startX, startZ, width, height, params.minArea,
-                                         &g_progress, threads, cont, /*phase1Pipeline=*/1, weird);
-        }
+        findBiggestRiverParallelPool(g_results, &g, startX, startZ, width, height, params.minArea,
+                                     &g_progress, threads, contSc, /*phase1Pipeline=*/1, weirdSc);
     }
     catch (const std::bad_alloc &)
     {
@@ -469,69 +476,77 @@ std::vector<Hit> search(const SearchParams &params)
 
     g_results.clear();
 
-    if (!res.empty())
+    if (lowyd_bench::enabled())
+        lowyd_bench::add(lowyd_bench::counters().phase2Candidates, (uint64_t) res.size());
+
     {
-        try
+        /* Bench scope covers the pool join in ~ThreadPool, i.e. the whole phase 2. */
+        lowyd_bench::Scope benchPhase2(lowyd_bench::STAGE_PHASE2);
+
+        if (!res.empty())
         {
-            ThreadPool pool((size_t) threads);
-            for (const auto &it: res)
+            try
             {
-                if (g_progress.try_stop.load())
-                    break;
-                pool.enqueue([&, cand = it, seedVal = params.seed, minArea = params.minArea,
-                              riverWeight, mc]() {
+                ThreadPool pool((size_t) threads);
+                for (const auto &it: res)
+                {
                     if (g_progress.try_stop.load())
-                        return;
-                    while (g_progress.try_pause.load())
-                    {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        break;
+                    pool.enqueue([&, cand = it, seedVal = params.seed, minArea = params.minArea,
+                                  riverWeight, mc]() {
                         if (g_progress.try_stop.load())
                             return;
-                    }
-                    g_progress.chunkInRunning.fetch_add(1);
+                        while (g_progress.try_pause.load())
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            if (g_progress.try_stop.load())
+                                return;
+                        }
+                        g_progress.chunkInRunning.fetch_add(1);
 
-                    // Per-worker Generator: setup once, re-seed when seed/mc changes.
-                    thread_local Generator tlsG;
-                    thread_local bool tlsInited = false;
-                    thread_local int tlsMc = -1;
-                    thread_local uint64_t tlsSeed = ~0ull;
-                    if (!tlsInited || tlsMc != mc)
-                    {
-                        setupGenerator(&tlsG, mc, FORCE_OCEAN_VARIANTS);
-                        tlsInited = true;
-                        tlsMc = mc;
-                        tlsSeed = ~0ull;
-                    }
-                    if (tlsSeed != seedVal)
-                    {
-                        applySeed(&tlsG, DIM_OVERWORLD, seedVal);
-                        tlsSeed = seedVal;
-                    }
+                        // Per-worker Generator: setup once, re-seed when seed/mc changes.
+                        thread_local Generator tlsG;
+                        thread_local bool tlsInited = false;
+                        thread_local int tlsMc = -1;
+                        thread_local uint64_t tlsSeed = ~0ull;
+                        if (!tlsInited || tlsMc != mc)
+                        {
+                            setupGenerator(&tlsG, mc, FORCE_OCEAN_VARIANTS);
+                            tlsInited = true;
+                            tlsMc = mc;
+                            tlsSeed = ~0ull;
+                        }
+                        if (tlsSeed != seedVal)
+                        {
+                            applySeed(&tlsG, DIM_OVERWORLD, seedVal);
+                            tlsSeed = seedVal;
+                        }
 
-                    auto temp = findBiggestRiver<1>(
-                        &tlsG,
-                        cand.point.x - SearchConfig::REFINE_HALF_WINDOW,
-                        cand.point.y - SearchConfig::REFINE_HALF_WINDOW,
-                        SearchConfig::REFINE_WINDOW_BLOCKS, SearchConfig::REFINE_WINDOW_BLOCKS,
-                        minArea, 1.0, FilterMode::PreciseBiome, riverWeight);
+                        auto temp = findBiggestRiver<1>(
+                            &tlsG,
+                            cand.point.x - SearchConfig::REFINE_HALF_WINDOW,
+                            cand.point.y - SearchConfig::REFINE_HALF_WINDOW,
+                            SearchConfig::REFINE_WINDOW_BLOCKS, SearchConfig::REFINE_WINDOW_BLOCKS,
+                            minArea, 1.0, FilterMode::PreciseBiome, riverWeight);
 
-                    if (!temp.empty() && temp[0].area >= minArea)
-                        g_results.addResult(temp[0]);
+                        if (!temp.empty() && temp[0].area >= minArea)
+                            g_results.addResult(temp[0]);
 
-                    g_progress.chunkInRunning.fetch_sub(1);
-                    g_progress.current.fetch_add(1);
-                });
+                        g_progress.chunkInRunning.fetch_sub(1);
+                        g_progress.current.fetch_add(1);
+                    });
+                }
             }
-        }
-        catch (const std::bad_alloc &)
-        {
-            resetProgressState();
-            return {};
-        }
-        catch (const std::exception &)
-        {
-            resetProgressState();
-            return {};
+            catch (const std::bad_alloc &)
+            {
+                resetProgressState();
+                return {};
+            }
+            catch (const std::exception &)
+            {
+                resetProgressState();
+                return {};
+            }
         }
     }
 

@@ -85,6 +85,10 @@ option(LOWYDRIPSTONE_BUILD_CLI "Build the standalone lowydripstonecavefinder-cli
 if(LOWYDRIPSTONE_BUILD_CLI)
     add_executable(lowydripstonecavefinder-cli lowydripstonecavefinder_cli.cpp)
     target_link_libraries(lowydripstonecavefinder-cli PRIVATE lowydripstonecavefinder-core)
+    if(WIN32)
+        # --bench reports the process peak working set (GetProcessMemoryInfo).
+        target_link_libraries(lowydripstonecavefinder-cli PRIVATE psapi)
+    endif()
     set_target_properties(lowydripstonecavefinder-cli PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )

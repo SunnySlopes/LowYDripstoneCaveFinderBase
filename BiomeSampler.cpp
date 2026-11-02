@@ -1,7 +1,10 @@
-#include "BiomeSampler.h"
+﻿#include "BiomeSampler.h"
+#include "Bench.h"
+#include "PerlinTable.h"
 #include "OctaveFieldCache.h"
 #include "cubiomes/biomes.h"
 #include "cubiomes/noise.h"
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <unordered_map>
@@ -10,49 +13,41 @@ const int PRECISE_YS[PRECISE_Y_COUNT] = { -60, -56, -52 };
 
 static constexpr double kDoublePerlinF = 337.0 / 331.0;
 
-static inline int modPositiveLocal(int a, int m)
-{
-    int r = a % m;
-    if (r < 0)
-        r += m;
-    return r;
-}
-
-static bool climateOnSampleLattice(int b, int sampleScale)
-{
-    if (sampleScale <= 0)
-        return false;
-    const int step = sampleScale / 4;
-    if (step <= 0)
-        return false;
-    const int half = step / 2;
-    return modPositiveLocal(b - half, step) == 0;
-}
-
+/*
+ * G0: the perlin is evaluated by lowyd::samplePerlinTable(), which is bit-identical to
+ * samplePerlin() but takes its gradients from a 16x3 table instead of the
+ * 16-way switch (no unpredictable branch on the hashed index).
+ */
 static double sampleOctALive(const DoublePerlinNoise *dpn, int idx, double x, double y, double z)
 {
     if (idx < 0 || idx >= dpn->octA.octcnt)
         return 0.0;
     const PerlinNoise *p = dpn->octA.octaves + idx;
     const double lf = p->lacunarity;
-    const double ax = maintainPrecision(x * lf);
-    const double ay = maintainPrecision(y * lf);
-    const double az = maintainPrecision(z * lf);
-    return p->amplitude * samplePerlin(p, ax, ay, az, 0, 0);
+    return p->amplitude * lowyd::samplePerlinTable(p, x * lf, y * lf, z * lf);
 }
 
-static double sampleContOctA(const DoublePerlinNoise *dpn, int idx, double x, double y, double z)
+/**
+ * Cont octA[i] with the A-table fast path.
+ *
+ * C2: `cache`/`probe` are resolved once per sample by the caller, so the
+ * lattice test and the cache read run once instead of once per octave, and the
+ * index itself is a shift+mask instead of two integer divisions per axis.
+ */
+static inline double contOctA(
+    const OctaveACache *cache, const ClimateProbe &probe,
+    const DoublePerlinNoise *dpn, int idx, double x, double y, double z)
+{
+    if (probe.onLattice && y == 0.0 && idx >= 0 && idx < OctaveACache::CONT_OCT)
+        return (double) cache->contA[idx].atIndex(probe.ix, probe.iz);
+    return sampleOctALive(dpn, idx, x, y, z);
+}
+
+/** Cache pointer usable for this thread, or nullptr. */
+static inline const OctaveACache *activeCache()
 {
     const OctaveACache *cache = getActiveOctaveACache();
-    if (cache && cache->ready && y == 0.0 && idx >= 0 && idx < OctaveACache::CONT_OCT)
-    {
-        const int bx = (int) x;
-        const int bz = (int) z;
-        const int scale = cache->contA[idx].sampleScale;
-        if (climateOnSampleLattice(bx, scale) && climateOnSampleLattice(bz, scale))
-            return (double) cache->contA[idx].atClimate(bx, bz);
-    }
-    return sampleOctALive(dpn, idx, x, y, z);
+    return (cache && cache->ready) ? cache : nullptr;
 }
 
 static double sampleContOctB(const DoublePerlinNoise *dpn, int idx, double x, double y, double z)
@@ -61,39 +56,93 @@ static double sampleContOctB(const DoublePerlinNoise *dpn, int idx, double x, do
         return 0.0;
     const PerlinNoise *p = dpn->octB.octaves + idx;
     const double lf = p->lacunarity;
-    const double ax = maintainPrecision(x * lf * kDoublePerlinF);
-    const double ay = maintainPrecision(y * lf * kDoublePerlinF);
-    const double az = maintainPrecision(z * lf * kDoublePerlinF);
-    return p->amplitude * samplePerlin(p, ax, ay, az, 0, 0);
+    return p->amplitude * lowyd::samplePerlinTable(p, x * lf * kDoublePerlinF,
+                                            y * lf * kDoublePerlinF,
+                                            z * lf * kDoublePerlinF);
 }
 
 static double sampleWeirdnessCached(const BiomeNoise *bn, double px, double pz)
 {
     const DoublePerlinNoise *dpn = &bn->climate[NP_WEIRDNESS];
-    const OctaveACache *cache = getActiveOctaveACache();
+    const OctaveACache *cache = activeCache();
     double v = 0.0;
     const int octCnt = dpn->octA.octcnt < dpn->octB.octcnt ? dpn->octA.octcnt : dpn->octB.octcnt;
     const int bx = (int) px;
     const int bz = (int) pz;
-    const bool useCache = cache && cache->ready
-        && px == (double) bx && pz == (double) bz;
+
+    /* C2: one lattice probe per sample, shared by all three ridge octaves. */
+    const bool exact = px == (double) bx && pz == (double) bz;
+    const ClimateProbe probe = (cache && exact) ? probeClimate(cache->ridgeA[0], bx, bz)
+                                                : ClimateProbe{};
 
     for (int i = 0; i < octCnt; i++)
     {
-        if (useCache && i < OctaveACache::RIDGE_OCT)
-        {
-            const int scale = cache->ridgeA[i].sampleScale;
-            if (climateOnSampleLattice(bx, scale) && climateOnSampleLattice(bz, scale))
-                v += (double) cache->ridgeA[i].atClimate(bx, bz);
-            else
-                v += sampleOctALive(dpn, i, px, 0.0, pz);
-        }
+        if (probe.onLattice && i < OctaveACache::RIDGE_OCT)
+            v += (double) cache->ridgeA[i].atIndex(probe.ix, probe.iz);
         else
             v += sampleOctALive(dpn, i, px, 0.0, pz);
         v += sampleContOctB(dpn, i, px, 0.0, pz);
     }
     return v * dpn->amplitude;
 }
+
+/**
+ * N7: the weirdness gate keeps |w| < 0.05 or |w| > 1.28. After the first two
+ * octave pairs the remaining pair (A2+B2) can move w by at most
+ * 1.25 * 2 * (a2A + a2B) * max|perlin|, so a partial sum strictly inside
+ * (0.05 + m, 1.28 - m) can never come back into either tail. The margin m is
+ * empirical: measured on 4.19 M cells, m = 0.14 gives 58% exits at a
+ * 0.11/1000 miss rate (budget is 1/1000).
+ */
+static constexpr double kWeirdEarlyLo = 0.05 + 0.14;
+static constexpr double kWeirdEarlyHi = 1.28 - 0.14;
+
+/** Escape hatch for A/B measurements: LOWYD_NO_WEIRD_EARLY=1 disables N7. */
+static inline bool weirdEarlyExitEnabled()
+{
+    static const bool enabled = [] {
+        const char *s = std::getenv("LOWYD_NO_WEIRD_EARLY");
+        return !(s && *s && *s != '0');
+    }();
+    return enabled;
+}
+
+/**
+ * Weirdness gate for whole-number climate coordinates with the A tables active.
+ * Returns the same boolean as passCaveWeirdness(bn, bx, bz, COARSE_SAMPLE_FLAGS),
+ * except for the ~1e-4 fraction of samples the early exit gives up on.
+ */
+bool passCaveWeirdnessFast(const BiomeNoise *bn, int bx, int bz)
+{
+    const DoublePerlinNoise *dpn = &bn->climate[NP_WEIRDNESS];
+    const OctaveACache *cache = activeCache();
+    const int octCnt = dpn->octA.octcnt < dpn->octB.octcnt ? dpn->octA.octcnt : dpn->octB.octcnt;
+    const ClimateProbe probe = cache ? probeClimate(cache->ridgeA[0], bx, bz) : ClimateProbe{};
+
+    double v = 0.0;
+    for (int i = 0; i < octCnt; i++)
+    {
+        if (probe.onLattice && i < OctaveACache::RIDGE_OCT)
+            v += (double) cache->ridgeA[i].atIndex(probe.ix, probe.iz);
+        else
+            v += sampleOctALive(dpn, i, bx, 0.0, bz);
+        v += sampleContOctB(dpn, i, bx, 0.0, bz);
+
+        if (i == 1 && weirdEarlyExitEnabled())
+        {
+            const double p = std::fabs(v * dpn->amplitude);
+            /* Cannot fall back under the low threshold nor climb over the high one. */
+            if (p > kWeirdEarlyLo && p < kWeirdEarlyHi)
+                return false;
+        }
+    }
+
+    int wi = (int) (10000.0 * (v * dpn->amplitude));
+    if (wi < 0)
+        wi = -wi;
+    return wi < 500 || wi > 12800;
+}
+
 
 bool passContinentalnessPartialThr(const BiomeNoise *bn, int bx, int bz, double threshold)
 {
@@ -105,11 +154,15 @@ bool passContinentalnessPartialThr(const BiomeNoise *bn, int bx, int bz, double 
     const double z = bz;
     double sum = 0.0;
 
-    sum += amp * (sampleContOctA(dpn, 0, x, y, z) + sampleContOctB(dpn, 0, x, y, z));
+    /* C2: all five cont octaves share one scale, so probe the lattice once. */
+    const OctaveACache *cache = activeCache();
+    const ClimateProbe probe = cache ? probeClimate(cache->contA[0], bx, bz) : ClimateProbe{};
+
+    sum += amp * (contOctA(cache, probe, dpn, 0, x, y, z) + sampleContOctB(dpn, 0, x, y, z));
     if (sum < -0.2)
         return false;
 
-    sum += amp * sampleContOctA(dpn, 1, x, y, z);
+    sum += amp * contOctA(cache, probe, dpn, 1, x, y, z);
     if (sum < -0.1)
         return false;
 
@@ -117,7 +170,7 @@ bool passContinentalnessPartialThr(const BiomeNoise *bn, int bx, int bz, double 
     if (sum < 0.0)
         return false;
 
-    sum += amp * sampleContOctA(dpn, 2, x, y, z);
+    sum += amp * contOctA(cache, probe, dpn, 2, x, y, z);
     if (sum < 0.13)
         return false;
 
@@ -125,7 +178,7 @@ bool passContinentalnessPartialThr(const BiomeNoise *bn, int bx, int bz, double 
     if (sum < 0.3)
         return false;
 
-    sum += amp * sampleContOctA(dpn, 3, x, y, z);
+    sum += amp * contOctA(cache, probe, dpn, 3, x, y, z);
     if (sum < 0.37)
         return false;
 
@@ -133,7 +186,7 @@ bool passContinentalnessPartialThr(const BiomeNoise *bn, int bx, int bz, double 
     if (sum < 0.44)
         return false;
 
-    sum += amp * (sampleContOctA(dpn, 4, x, y, z) + sampleContOctB(dpn, 4, x, y, z));
+    sum += amp * (contOctA(cache, probe, dpn, 4, x, y, z) + sampleContOctB(dpn, 4, x, y, z));
     return sum > threshold;
 }
 
@@ -151,7 +204,7 @@ static int quantWeirdness(const BiomeNoise *bn, int bx, int bz, uint32_t sample_
         pz += sampleDoublePerlin(&bn->climate[NP_SHIFT], bz, bx, 0) * 4.0;
     }
     float w;
-    if (getActiveOctaveACache() && getActiveOctaveACache()->ready)
+    if (activeCache() != nullptr)
         w = (float) sampleWeirdnessCached(bn, px, pz);
     else
         w = sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
@@ -161,6 +214,11 @@ static int quantWeirdness(const BiomeNoise *bn, int bx, int bz, uint32_t sample_
 
 bool passCaveWeirdness(const BiomeNoise *bn, int bx, int bz, uint32_t sample_flags)
 {
+    /* N7: the whole-number, no-shift case can use the early-exiting variant
+     * (identical gate, ~1e-4 of samples given up on by design). */
+    if ((sample_flags & SAMPLE_NO_SHIFT) && getActiveOctaveACache())
+        return passCaveWeirdnessFast(bn, bx, bz);
+
     int wi = quantWeirdness(bn, bx, bz, sample_flags);
     return wi < 500 || wi > 12800;
 }

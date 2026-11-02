@@ -14,6 +14,7 @@
 
 #include "lowydripstonecavefinder.h"
 
+#include "Bench.h"
 #include "cubiomes/biomes.h"
 #include "cubiomes/util.h"
 
@@ -37,10 +38,21 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <psapi.h>
+#endif
+
 namespace {
 
-constexpr const char *kCliVersion = "1.0.0";
-constexpr const char *kEngineVersion = "1.0.0";
+constexpr const char *kCliVersion = "1.1.0";
+constexpr const char *kEngineVersion = "1.1.0";
 
 constexpr int kRingOuter = lowyd::RING_OUTER;
 constexpr double kFullRingArea = lowyd::RIVER_AREA_FULL;
@@ -79,6 +91,8 @@ struct Options {
 
     bool weirdnessOnly = false;
     long long weirdnessSeed = 0;
+
+    bool bench = false;
 
     bool help = false;
     bool version = false;
@@ -135,6 +149,9 @@ void printUsage(std::ostream &os)
         "Output:\n"
         "  --limit <int>           maximum result rows, default 0 = all\n"
         "  --out <file>            also write the text report to <file>\n"
+        "  --bench                 print per-stage timings to stderr after the run\n"
+        "                          (phase0 / cont mask / weird ring / climate coarse /\n"
+        "                          phase2, plus candidate counts and peak working set)\n"
         "  --help, -h              show this help\n"
         "  --version               show CLI / engine versions\n"
         "\n"
@@ -400,6 +417,10 @@ Options parseOptions(int argc, char **argv)
             if (options.outPath.empty())
                 usageError("--out requires a non-empty path");
         }
+        else if (arg == "--bench")
+        {
+            options.bench = true;
+        }
         else
         {
             usageError("unknown option: " + std::string(arg));
@@ -621,6 +642,93 @@ void writeReport(const std::string &report, const std::string &outPath)
     std::cerr << "report written to " << outPath << "\n";
 }
 
+/** Peak working set of this process in MiB, or 0 when unsupported. */
+double peakWorkingSetMiB()
+{
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+        return static_cast<double>(counters.PeakWorkingSetSize) / (1024.0 * 1024.0);
+#endif
+    return 0.0;
+}
+
+/**
+ * C0: per-stage timing summary. Printed to stderr so stdout keeps exactly the
+ * text report that --out writes.
+ */
+std::string formatBenchReport(double wallSeconds)
+{
+    const lowyd_bench::Counters &c = lowyd_bench::counters();
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1);
+
+    double totalMs = 0.0;
+    for (int i = 0; i < lowyd_bench::STAGE_COUNT; i++)
+        totalMs += static_cast<double>(c.ns[i].load()) / 1e6;
+
+    out << "=== bench: stage timings ===\n";
+    out << "(ms is thread time summed over all workers; % shares are of that sum,\n"
+        << " so a well-parallelised run has a sum well above the wall clock)\n";
+    out << std::left << std::setw(24) << "stage" << std::right << std::setw(11) << "ms"
+        << std::setw(8) << "%" << std::setw(10) << "calls" << "\n";
+    for (int i = 0; i < lowyd_bench::STAGE_COUNT; i++)
+    {
+        const double ms = static_cast<double>(c.ns[i].load()) / 1e6;
+        const double pct = totalMs > 0.0 ? 100.0 * ms / totalMs : 0.0;
+        out << std::left << std::setw(24) << lowyd_bench::stageName(static_cast<lowyd_bench::Stage>(i))
+            << std::right << std::setw(11) << ms << std::setw(8) << pct
+            << std::setw(10) << c.calls[i].load() << "\n";
+    }
+    out << std::left << std::setw(24) << "sum of stages" << std::right << std::setw(11) << totalMs
+        << "\n";
+    out << std::left << std::setw(24) << "wall clock" << std::right << std::setw(11)
+        << wallSeconds * 1000.0 << "\n";
+
+    const uint64_t tiles = c.contTiles.load();
+    const uint64_t passed = c.contTilesPass.load();
+    out << "\n=== bench: work counted ===\n";
+    out << "chunks                " << c.chunks.load()
+        << "   on A-table lattice  " << c.latticeChunks.load() << "\n";
+    out << "cont prefilter tiles  " << tiles << "   passed  " << passed;
+    if (tiles > 0)
+        out << std::setprecision(2) << " (" << (100.0 * static_cast<double>(passed) / static_cast<double>(tiles)) << "%)";
+    out << std::setprecision(1) << "\n";
+    out << "ring centers summed   " << c.ringCenters.load() << "\n";
+    out << "climate subsearches   " << c.coarseSubsearches.load()
+        << "   coarse cells  " << c.coarseCells.load() << "\n";
+    out << "phase2 candidates     " << c.phase2Candidates.load() << "\n";
+    out << "weird cells evaluated " << c.weirdCells.load() << "\n";
+    out << "dilation writes saved " << c.dilateWrites.load()
+        << "   (naive Chebyshev writes replaced by the difference array)\n";
+
+    /* N0: per-unit cost, the only figure that is comparable across variants. */
+    const uint64_t wcells = c.weirdCells.load();
+    const uint64_t ccells = c.coarseCells.load();
+    if (wcells || ccells || tiles)
+    {
+        out << "\n=== bench: ns per unit (thread time) ===\n";
+        if (tiles)
+            out << "cont prefilter  " << (double) c.ns[lowyd_bench::STAGE_CONT_MASK].load() / (double) tiles
+                << " ns/tile\n";
+        if (wcells)
+            out << "weird ring      " << (double) c.ns[lowyd_bench::STAGE_WEIRD_RING].load() / (double) wcells
+                << " ns/cell\n";
+        if (ccells)
+            out << "climate coarse  " << (double) c.ns[lowyd_bench::STAGE_CLIMATE_COARSE].load() / (double) ccells
+                << " ns/cell\n";
+    }
+
+    const double tableMiB = static_cast<double>(c.phase0Bytes.load()) / (1024.0 * 1024.0);
+    out << "A tables              " << tableMiB << " MiB, "
+        << c.phase0Samples.load() << " cells built (0 = phase 0 skipped)\n";
+
+    const double peakMiB = peakWorkingSetMiB();
+    if (peakMiB > 0.0)
+        out << "peak working set      " << peakMiB << " MiB\n";
+    return out.str();
+}
+
 } // namespace
 
 int run(int argc, char **argv)
@@ -687,6 +795,12 @@ int run(int argc, char **argv)
 
     const auto started = std::chrono::steady_clock::now();
 
+    if (options.bench)
+    {
+        lowyd_bench::reset();
+        lowyd_bench::setEnabled(true);
+    }
+
     // Lightweight stderr progress; stdout stays reserved for the report.
     std::atomic_bool monitorDone{false};
     std::thread monitor([&monitorDone]() {
@@ -737,6 +851,12 @@ int run(int argc, char **argv)
     if (hits.size() != totalHits)
         std::cerr << " (shown; " << totalHits << " raw)";
     std::cerr << "\n";
+
+    if (options.bench)
+    {
+        lowyd_bench::setEnabled(false);
+        std::cerr << "\n" << formatBenchReport(static_cast<double>(elapsed.count()) / 1000.0);
+    }
     return 0;
 }
 

@@ -89,11 +89,11 @@ static bool pitPausedOrStopped(Progress *progress)
 
 static double rawOctave(const PerlinNoise *p, double x, double z)
 {
+    /* Same table-gradient sampler as the normal search: bit-identical to
+     * samplePerlin(p, x*lf, 0, z*lf, 0, 0) (maintainPrecision is a no-op here),
+     * without the 16-way switch in the inner loop. */
     const double lf = p->lacunarity;
-    const double ax = maintainPrecision(x * lf);
-    const double ay = maintainPrecision(0.0 * lf);
-    const double az = maintainPrecision(z * lf);
-    return p->amplitude * samplePerlin(p, ax, ay, az, 0, 0);
+    return p->amplitude * samplePerlinTable(p, x * lf, 0.0, z * lf);
 }
 
 /** One octave in the same units as sampleDoublePerlin. */

@@ -76,7 +76,8 @@ foreach ($src in $CppSources) {
 
 $Exe = Join-Path $OutDir "lowydripstonecavefinder-cli.exe"
 Write-Host "LINK $Exe"
-& $Gxx -static -pthread -o $Exe @Objs -static-libgcc -static-libstdc++
+# -lpsapi: --bench reports the process peak working set (GetProcessMemoryInfo).
+& $Gxx -static -pthread -o $Exe @Objs -static-libgcc -static-libstdc++ -lpsapi
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
 Write-Host "Built $Exe"
 Get-Item $Exe | Format-List FullName, Length, LastWriteTime

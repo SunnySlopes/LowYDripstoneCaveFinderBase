@@ -1,4 +1,4 @@
-#include "lowydripstonecavefinder.h"
+﻿#include "lowydripstonecavefinder.h"
 
 #include "cubiomes/generator.h"
 #include "cubiomes/biomes.h"
@@ -16,6 +16,10 @@
 #include <cmath>
 #include <cstdint>
 #include <thread>
+
+// Bench.h and OctaveFieldCache.h are included at global scope by
+// lowydripstonecavefinder.cpp before this file is pulled in, so lowyd_bench::,
+// OctaveACache and probeClimate() are already visible here.
 
 enum class FilterMode {
     WeirdnessOnly,
@@ -279,6 +283,7 @@ std::vector<Res> findBiggestRiver(
 
     if constexpr (scale > 1)
     {
+        uint64_t weirdCells = 0;
         for (int z = 0; z < H; z++)
         {
             const int worldZ = startZ + z * scale + scale / 2;
@@ -304,11 +309,15 @@ std::vector<Res> findBiggestRiver(
                     continue;
                 }
                 const int v = coarseCellValue(g, worldX, worldZ, mode);
+                if (mode == FilterMode::WeirdnessOnly)
+                    weirdCells++;
                 RAWR(x, z) = v;
                 if (v)
                     markOcc(x, z);
             }
         }
+        if (lowyd_bench::enabled() && weirdCells)
+            lowyd_bench::add(lowyd_bench::counters().weirdCells, weirdCells);
     } else
     {
         fillPreciseGrid(g, startX, startZ, W, H, rawRiver, rawCave);
@@ -369,6 +378,7 @@ std::vector<Res> findBiggestRiver(
 
     std::priority_queue<CandidateArea> pq;
     const auto &ring = getRingMask<scale>();
+    uint64_t ringCalls = 0;
 
     auto ringSum = [&](const std::vector<int> &pref, int cx, int cz) -> int {
         /* Hot path: annular sum via 2D prefix; keep branch light and locals in registers. */
@@ -408,11 +418,22 @@ std::vector<Res> findBiggestRiver(
 
     CandidateArea maxA{0, 0, 0, 0, 0};
 
-    /* Sparse ring centers: Chebyshev dilate of pass cells by R_out (keeps recall vs raw==1-only). */
+    /* Sparse ring centers: Chebyshev dilate of pass cells by R_out (keeps recall vs raw==1-only).
+     *
+     * C3: the naive form writes (2R_out+1)^2 cells per pass cell, which at scale 4
+     * is 4225 writes for every passing cell. A 2D difference array makes each source
+     * cell cost four increments, followed by one reconstruction pass. The write range
+     * is clamped to the same [R_out, W-R_out-1] x [R_out, H-R_out-1] box the scan loop
+     * reads, so the resulting mask is identical. */
     std::vector<uint8_t> centerCand;
     if constexpr (scale > 1)
     {
         centerCand.assign((size_t) W * (size_t) H, 0);
+
+        const int diffStride = W + 1;
+        std::vector<int32_t> diff((size_t) diffStride * (size_t) (H + 1), 0);
+        uint64_t naiveWrites = 0;
+
         for (int z = 0; z < H; z++)
         {
             for (int x = 0; x < W; x++)
@@ -423,11 +444,34 @@ std::vector<Res> findBiggestRiver(
                 const int z1 = std::min(H - R_out - 1, z + R_out);
                 const int x0 = std::max(R_out, x - R_out);
                 const int x1 = std::min(W - R_out - 1, x + R_out);
-                for (int cz = z0; cz <= z1; cz++)
-                    for (int cx = x0; cx <= x1; cx++)
-                        centerCand[(size_t) cz * (size_t) W + (size_t) cx] = 1;
+                if (x0 > x1 || z0 > z1)
+                    continue;
+                diff[(size_t) z0 * (size_t) diffStride + (size_t) x0] += 1;
+                diff[(size_t) z0 * (size_t) diffStride + (size_t) (x1 + 1)] -= 1;
+                diff[(size_t) (z1 + 1) * (size_t) diffStride + (size_t) x0] -= 1;
+                diff[(size_t) (z1 + 1) * (size_t) diffStride + (size_t) (x1 + 1)] += 1;
+                if (lowyd_bench::enabled())
+                    naiveWrites += (uint64_t) (x1 - x0 + 1) * (uint64_t) (z1 - z0 + 1);
             }
         }
+
+        for (int z = 0; z < H; z++)
+        {
+            int rowRun = 0;
+            const size_t base = (size_t) z * (size_t) diffStride;
+            const size_t prev = z > 0 ? base - (size_t) diffStride : base;
+            uint8_t *outRow = centerCand.data() + (size_t) z * (size_t) W;
+            for (int x = 0; x < W; x++)
+            {
+                rowRun += diff[base + (size_t) x];
+                const int value = rowRun + (z > 0 ? diff[prev + (size_t) x] : 0);
+                diff[base + (size_t) x] = value;
+                outRow[x] = value > 0 ? 1 : 0;
+            }
+        }
+
+        if (lowyd_bench::enabled())
+            lowyd_bench::add(lowyd_bench::counters().dilateWrites, naiveWrites);
     }
 
     for (int cz = R_out; cz < H - R_out; cz++)
@@ -445,6 +489,9 @@ std::vector<Res> findBiggestRiver(
                 if (!occAnyInRect(cx - R_out, cx + R_out, cz - R_out, cz + R_out))
                     continue;
             }
+
+            if (lowyd_bench::enabled())
+                ringCalls++;
 
             int worldTotal;
             int worldCave;
@@ -494,6 +541,14 @@ std::vector<Res> findBiggestRiver(
 #undef RAWC
 #undef ARRR
 #undef ARRC
+
+    if (lowyd_bench::enabled())
+    {
+        lowyd_bench::Counters &c = lowyd_bench::counters();
+        lowyd_bench::add(c.ringCenters, ringCalls);
+        if constexpr (scale > 1)
+            lowyd_bench::add(c.coarseCells, (uint64_t) W * (uint64_t) H);
+    }
     return result;
 }
 
@@ -616,11 +671,32 @@ void findBiggestRiverParallelPool(
 
                     /* Cont prefilter + WeirdnessOnly ring. Keep only product scales 16/32
                      * so the fast (32) path stays as lean as the pre-UI Cont@128+Weird@32 build. */
-                    const auto contMask = buildDilatedContPrefilterMask(
-                        &tlsG, csx, csz, currentSx, currentSz,
-                        contScale,
-                        SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD,
-                        SearchConfig::PHASE1_CONT_PREFILTER_DILATE);
+                    std::vector<uint8_t> contMask;
+                    {
+                        lowyd_bench::Scope benchScope(lowyd_bench::STAGE_CONT_MASK);
+                        contMask = buildDilatedContPrefilterMask(
+                            &tlsG, csx, csz, currentSx, currentSz,
+                            contScale,
+                            SearchConfig::PHASE1_CONT_PREFILTER_THRESHOLD,
+                            SearchConfig::PHASE1_CONT_PREFILTER_DILATE);
+                    }
+                    if (lowyd_bench::enabled())
+                    {
+                        lowyd_bench::Counters &bench = lowyd_bench::counters();
+                        lowyd_bench::add(bench.chunks, 1);
+                        lowyd_bench::add(bench.contTiles, (uint64_t) contMask.size());
+                        lowyd_bench::add(bench.contTilesPass, (uint64_t) std::count_if(
+                            contMask.begin(), contMask.end(), [](uint8_t v) { return v != 0; }));
+                        /* C2/C1 diagnostic: does this window land on the A-table lattice? */
+                        const OctaveACache *cache = getActiveOctaveACache();
+                        if (cache && cache->ready && contScale > 0)
+                        {
+                            const int nx0 = (csx + contScale / 2) / 4;
+                            const int nz0 = (csz + contScale / 2) / 4;
+                            if (probeClimate(cache->contA[0], nx0, nz0).onLattice)
+                                lowyd_bench::add(bench.latticeChunks, 1);
+                        }
+                    }
                     if (std::none_of(contMask.begin(), contMask.end(),
                                      [](uint8_t v) { return v != 0; }))
                     {
@@ -629,19 +705,22 @@ void findBiggestRiverParallelPool(
                     }
 
                     std::vector<Res> blockResultsCoarse;
-                    if (weirdScale <= 16)
                     {
-                        blockResultsCoarse = findBiggestRiver<16>(
-                            &tlsG, csx, csz, currentSx, currentSz,
-                            minArea, 0.8, FilterMode::WeirdnessOnly,
-                            0.7f, &contMask, contScale);
-                    }
-                    else
-                    {
-                        blockResultsCoarse = findBiggestRiver<SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE>(
-                            &tlsG, csx, csz, currentSx, currentSz,
-                            minArea, 0.8, FilterMode::WeirdnessOnly,
-                            0.7f, &contMask, contScale);
+                        lowyd_bench::Scope benchScope(lowyd_bench::STAGE_WEIRD_RING);
+                        if (weirdScale <= 16)
+                        {
+                            blockResultsCoarse = findBiggestRiver<16>(
+                                &tlsG, csx, csz, currentSx, currentSz,
+                                minArea, 0.8, FilterMode::WeirdnessOnly,
+                                0.7f, &contMask, contScale);
+                        }
+                        else
+                        {
+                            blockResultsCoarse = findBiggestRiver<SearchConfig::PHASE1_WEIRDNESS_GRID_SCALE>(
+                                &tlsG, csx, csz, currentSx, currentSz,
+                                minArea, 0.8, FilterMode::WeirdnessOnly,
+                                0.7f, &contMask, contScale);
+                        }
                     }
 
                     const int bx = currentSx / tile + 2;
@@ -667,11 +746,17 @@ void findBiggestRiverParallelPool(
                     int max = 0;
                     for (auto &res: pqX16)
                     {
-                        auto subResults = findBiggestRiver<SearchConfig::PHASE1_CLIMATE_GRID_SCALE>(
-                            &tlsG,
-                            res.point.x - subR, res.point.y - subR,
-                            subSz, subSz,
-                            minArea, 1.0, FilterMode::ClimateCoarse);
+                        std::vector<Res> subResults;
+                        {
+                            lowyd_bench::Scope benchScope(lowyd_bench::STAGE_CLIMATE_COARSE);
+                            subResults = findBiggestRiver<SearchConfig::PHASE1_CLIMATE_GRID_SCALE>(
+                                &tlsG,
+                                res.point.x - subR, res.point.y - subR,
+                                subSz, subSz,
+                                minArea, 1.0, FilterMode::ClimateCoarse);
+                            if (lowyd_bench::enabled())
+                                lowyd_bench::add(lowyd_bench::counters().coarseSubsearches, 1);
+                        }
 
                         if (subResults.empty()) break;
                         if (subResults[0].area < max * 0.9) break;

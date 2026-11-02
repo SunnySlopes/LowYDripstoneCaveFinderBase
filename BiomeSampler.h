@@ -14,6 +14,14 @@ static constexpr int COARSE_Y_PARAM = 256 / 4 + 1;
 static constexpr double CONT_PARTIAL_FINAL_THRESHOLD = 0.55;
 
 bool passCaveWeirdness(const BiomeNoise *bn, int bx, int bz, uint32_t sample_flags);
+
+/**
+ * N7: same gate as passCaveWeirdness(bn, bx, bz, COARSE_SAMPLE_FLAGS) for
+ * whole-number climate coordinates, with the early exit after the second
+ * octave pair. Gives up on ~1e-4 of samples by design.
+ */
+bool passCaveWeirdnessFast(const BiomeNoise *bn, int bx, int bz);
+
 bool passCaveClimate(const BiomeNoise *bn, int bx, int bz, uint32_t sample_flags);
 bool passContinentalnessPartial(const BiomeNoise *bn, int bx, int bz);
 /** Octave early-exit Cont; final compare uses threshold (climate units). */
