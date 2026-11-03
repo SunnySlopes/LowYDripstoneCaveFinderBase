@@ -12,7 +12,9 @@
 #define LOWYDRIPSTONECAVEFINDER_LOWYDRIPSTONECAVEFINDER_H
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace lowyd {
@@ -37,6 +39,76 @@ constexpr int PHASE1_WEIRD_SCALE_PRECISE = 16;
 
 /** Matches the Java runner's default refinement coefficient. */
 constexpr float DEFAULT_PRESERVE_RANGE = 0.9f;
+
+/*
+ * Precise layer window (B1).
+ *
+ * The precise pass samples every layer in [yMin, yMax] and integrates the
+ * counts as a volume: the per-layer average is reported, so every score keeps
+ * the historical 0..49640 "effective cave cells" range.  The span is capped:
+ * fillPreciseWindow() allocates 320x320xLx4 B per worker (19.7 MB at L=48) and
+ * above L=48 the 128-block shell no longer covers a full layer, so the model
+ * itself stops making sense.
+ */
+constexpr int Y_LIMIT_MIN = -63;
+constexpr int Y_LIMIT_MAX = 319;
+constexpr int Y_MAX_SPAN = 48;
+constexpr int Y_DEFAULT_MIN = -63;
+constexpr int Y_DEFAULT_MAX = -51;
+constexpr int COARSE_Y_DEFAULT = -51;
+
+/** Layer range of the precise pass.  L = yMax - yMin + 1, capped at 1..Y_MAX_SPAN. */
+struct PreciseYRange {
+    int yMin = Y_DEFAULT_MIN;
+    int yMax = Y_DEFAULT_MAX;
+
+    /** Layer count, clamped to a legal 1..Y_MAX_SPAN (validate() rejects the rest). */
+    int count() const
+    {
+        const int n = yMax - yMin + 1;
+        if (n < 1) return 1;
+        return n > Y_MAX_SPAN ? Y_MAX_SPAN : n;
+    }
+};
+
+/**
+ * Export / result tag including the aggregation model and the layer count,
+ * e.g. "drowned-weighted-volume-b/13".  Results of different versions are not
+ * comparable, so this must travel with every result set.
+ *
+ * Header-inline: the All-In-One host includes the engine sources at global
+ * scope and does not compile lowydripstonecavefinder.cpp, so shared helpers
+ * must not live in that translation unit.
+ */
+inline std::string modelId(int yMin, int yMax)
+{
+    const int layers = yMax - yMin + 1;
+    return "drowned-weighted-volume-b/" + std::to_string(layers > 0 ? layers : 0);
+}
+
+/**
+ * Volume-integral aggregation of one ring (B1).
+ *
+ * sumCave / sumRiver are the summed per-layer hit counts of the annulus,
+ * range 0..49640*L.  Returns the weighted total as the per-layer average
+ * (0..49640), so minArea, the refinement coefficient and sorting keep their
+ * historical meaning.  caveAvg / riverAvg receive the unweighted per-layer
+ * averages when non-null.
+ */
+inline int aggregateLayerAverages(int sumCave, int sumRiver, float riverWeight, int layers,
+                                  int *caveAvg = nullptr, int *riverAvg = nullptr)
+{
+    const int L = layers < 1 ? 1 : (layers > Y_MAX_SPAN ? Y_MAX_SPAN : layers);
+    const int cave = (int) std::lround((double) sumCave / (double) L);
+    const int riverAvgValue = (int) std::lround((double) sumRiver / (double) L);
+    if (caveAvg != nullptr)
+        *caveAvg = cave;
+    if (riverAvg != nullptr)
+        *riverAvg = riverAvgValue;
+    /* int64 intermediate would also fit, but int32 is already safe at L<=48. */
+    return (int) std::lround(((double) sumCave + (double) riverWeight * (double) sumRiver)
+                             / (double) L);
+}
 
 /**
  * Live counters published by a running search.
@@ -89,6 +161,19 @@ struct SearchParams {
     int minArea = 0;
     float preserveRange = DEFAULT_PRESERVE_RANGE;
     float riverWeight = 0.75f;
+    /**
+     * Precise layer window (B1).  yMax - yMin + 1 must be <= Y_MAX_SPAN; see
+     * validate().  The score is the per-layer average of the cave/river volume,
+     * so it keeps the 0..49640 scale regardless of the layer count.
+     */
+    int yMin = Y_DEFAULT_MIN;
+    int yMax = Y_DEFAULT_MAX;
+    /**
+     * Recall knob of the coarse stage.  The climate prefilter used by this
+     * engine (continentalness + weirdness) is Y-independent, so the value is
+     * carried for protocol/CLI compatibility and does not change the scan.
+     */
+    int coarseY = COARSE_Y_DEFAULT;
     int numThreads = 0;
     int mc = 35; // cubiomes MC_26_3
     int contScale = 0;  // <= 0 uses the SearchConfig default (128)
@@ -102,6 +187,41 @@ struct SearchParams {
      */
     int allowGpu = 1;
 };
+
+/**
+ * Validates the layer window: yMin <= yMax, both inside [-63, 319], and
+ * yMax - yMin + 1 <= Y_MAX_SPAN.  Returns false and fills *error (when non-null)
+ * on failure; the GUI / CLI reject the search before calling search().
+ *
+ * Header-inline for the All-In-One host (see modelId()).
+ */
+inline bool validate(const SearchParams &params, std::string *error)
+{
+    const int yMin = params.yMin;
+    const int yMax = params.yMax;
+    const int layers = yMax - yMin + 1;
+
+    auto fail = [error](std::string message) {
+        if (error != nullptr)
+            *error = std::move(message);
+        return false;
+    };
+
+    if (yMin > yMax)
+        return fail("yMin (" + std::to_string(yMin) + ") must not be greater than yMax ("
+                    + std::to_string(yMax) + ")");
+    if (yMin < Y_LIMIT_MIN || yMax > Y_LIMIT_MAX)
+        return fail("layer range must stay within [" + std::to_string(Y_LIMIT_MIN) + ", "
+                    + std::to_string(Y_LIMIT_MAX) + "] (got [" + std::to_string(yMin) + ", "
+                    + std::to_string(yMax) + "])");
+    if (layers > Y_MAX_SPAN)
+        return fail("layer span must not exceed " + std::to_string(Y_MAX_SPAN)
+                    + " layers (got " + std::to_string(layers)
+                    + "); the window cache and the 128-block shell model both stop holding");
+    if (error != nullptr)
+        error->clear();
+    return true;
+}
 
 /** Clears pause/stop flags, progress counters and the "now" result list. */
 void resetSearchState();

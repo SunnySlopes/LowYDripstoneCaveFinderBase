@@ -62,7 +62,8 @@ jintArray toIntArray(JNIEnv *env, const std::vector<lowyd::Hit> &hits)
 
 JNIEXPORT jintArray JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge_riverSearch
   (JNIEnv *env, jclass, jlong seed, jint startX, jint startZ,
-   jint width, jint height, jint /*y*/, jint minArea, jfloat opV, jfloat riverWeight, jint numThreads,
+   jint width, jint height, jint yMin, jint yMax, jint coarseY, jint minArea,
+   jfloat opV, jfloat riverWeight, jint numThreads,
    jstring mcVersion, jint contScale, jint weirdScale, jint searchMode, jboolean allowGpu)
 {
     lowyd::SearchParams params;
@@ -71,6 +72,9 @@ JNIEXPORT jintArray JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveF
     params.startZ = startZ;
     params.width = width;
     params.height = height;
+    params.yMin = yMin;
+    params.yMax = yMax;
+    params.coarseY = coarseY;
     params.minArea = minArea;
     params.preserveRange = opV;
     params.riverWeight = riverWeight;
@@ -81,6 +85,7 @@ JNIEXPORT jintArray JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveF
     params.searchMode = searchMode;
     params.allowGpu = (allowGpu != JNI_FALSE) ? 1 : 0;
 
+    /* The GUI validates the layer window; a bad one yields null (no hits). */
     return toIntArray(env, lowyd::search(params));
 }
 

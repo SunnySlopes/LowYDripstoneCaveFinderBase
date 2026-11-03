@@ -89,10 +89,25 @@ def requireMsys2 = {
     }
 }
 
+/*
+ * Declare the real native inputs.  Without this the Exec tasks only see their
+ * output directory, so any header change looked UP-TO-DATE and the packaged
+ * DLL/CLI silently stayed stale.
+ */
+def nativeSourceFiles = fileTree(projectDir) {
+    include '*.c', '*.cpp', '*.h'
+    include 'cxx_compat/**'
+    include 'jni/**'
+    include 'cubiomes/**/*.c', 'cubiomes/**/*.h'
+    exclude 'build/**'
+}
+
 tasks.register('buildNativeMsys2', Exec) {
     group = 'build'
     description = 'Build libDripstoneCaveFinderLibJ.dll via MSYS2 gcc/g++ (LowYDripstoneCaveFinderBase)'
     dependsOn checkCubiomesSubmodule
+    inputs.files(nativeSourceFiles)
+    inputs.file('build_jni_msys2.ps1')
     outputs.dir(nativeOutDir)
 
     doFirst {
@@ -130,6 +145,8 @@ tasks.register('buildCliMsys2', Exec) {
     group = 'build'
     description = 'Build the standalone lowydripstonecavefinder-cli.exe via MSYS2 gcc/g++'
     dependsOn checkCubiomesSubmodule
+    inputs.files(nativeSourceFiles)
+    inputs.file('build_cli_msys2.ps1')
     outputs.dir(cliOutDir)
 
     doFirst {

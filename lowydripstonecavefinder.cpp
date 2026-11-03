@@ -83,6 +83,19 @@ std::mutex g_searchMutex;
 Progress g_progress{};
 ThreadSafeResults<Res> g_results{};
 
+/**
+ * B6: setupGenerator() costs ~0.29 s and only depends on `mc` (it wires the
+ * BiomeNoise / btree pointers), so one generator is reused across seeds.  Only
+ * applySeed() runs per call.  search() holds g_searchMutex, so no extra lock.
+ */
+struct GeneratorCache
+{
+    int mc = -1;
+    Generator g{};
+};
+
+GeneratorCache g_generatorCache;
+
 std::vector<Res> dedup(const std::vector<Res> &v)
 {
     std::set<Point> seen;
@@ -334,6 +347,17 @@ std::vector<Hit> search(const SearchParams &params)
 {
     std::lock_guard<std::mutex> guard(g_searchMutex);
 
+    if (!validate(params, nullptr))
+    {
+        g_results.clear();
+        resetProgressState();
+        return {};
+    }
+
+    PreciseScratchSession scratchSession;
+
+    const PreciseYRange yRange{params.yMin, params.yMax};
+
     float riverWeight = params.riverWeight;
     if (riverWeight < 0.0f) riverWeight = 0.0f;
     if (riverWeight > 1.0f) riverWeight = 1.0f;
@@ -342,8 +366,15 @@ std::vector<Hit> search(const SearchParams &params)
     if (mc < MC_1_18 || mc > MC_NEWEST)
         mc = MC_26_1;
 
-    Generator g;
-    setupGenerator(&g, mc, FORCE_OCEAN_VARIANTS);
+    /* B6: reuse the Generator.  setupGenerator() only depends on `mc`; the seed
+     * is applied per call and phase-2 workers keep their own thread_local
+     * generators, so this saves the ~0.29 s setup on every batch seed. */
+    if (g_generatorCache.mc != mc)
+    {
+        setupGenerator(&g_generatorCache.g, mc, FORCE_OCEAN_VARIANTS);
+        g_generatorCache.mc = mc;
+    }
+    Generator &g = g_generatorCache.g;
     applySeed(&g, DIM_OVERWORLD, params.seed);
 
     g_results.clear();
@@ -369,7 +400,7 @@ std::vector<Hit> search(const SearchParams &params)
         try
         {
             finallyResults = runLargePitSearch(&g, params.minArea, riverWeight, threads, &g_progress,
-                                               boxMinX, boxMaxX, boxMinZ, boxMaxZ);
+                                               boxMinX, boxMaxX, boxMinZ, boxMaxZ, yRange);
         }
         catch (const std::bad_alloc &)
         {
@@ -501,6 +532,9 @@ std::vector<Hit> search(const SearchParams &params)
 
     setActiveOctaveACache(nullptr);
 
+    /* Phase-1 workers are joined; their (small) scratch buffers are done. */
+    clearPreciseScratchPool();
+
     auto res = g_results.getAllResults();
     if (g_progress.try_stop.load())
     {
@@ -569,7 +603,8 @@ std::vector<Hit> search(const SearchParams &params)
                             cand.point.x - SearchConfig::REFINE_HALF_WINDOW,
                             cand.point.y - SearchConfig::REFINE_HALF_WINDOW,
                             SearchConfig::REFINE_WINDOW_BLOCKS, SearchConfig::REFINE_WINDOW_BLOCKS,
-                            minArea, 1.0, FilterMode::PreciseBiome, riverWeight);
+                            minArea, 1.0, FilterMode::PreciseBiome, riverWeight,
+                            nullptr, 0, nullptr, yRange);
 
                         if (!temp.empty() && temp[0].area >= minArea)
                             g_results.addResult(temp[0]);

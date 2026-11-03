@@ -1,4 +1,4 @@
-﻿#include "BiomeSampler.h"
+#include "BiomeSampler.h"
 #include "Bench.h"
 #include "PerlinTable.h"
 #include "OctaveFieldCache.h"
@@ -7,11 +7,37 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
-const int PRECISE_YS[PRECISE_Y_COUNT] = { -60, -56, -52 };
-
 static constexpr double kDoublePerlinF = 337.0 / 331.0;
+
+namespace {
+
+std::mutex g_scratchMutex;
+std::unordered_map<std::thread::id, std::unique_ptr<PreciseScratch>> g_scratches;
+
+} // namespace
+
+PreciseScratch &preciseScratch()
+{
+    const std::thread::id id = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(g_scratchMutex);
+    std::unique_ptr<PreciseScratch> &slot = g_scratches[id];
+    if (!slot)
+        slot = std::make_unique<PreciseScratch>();
+    /* unordered_map nodes are stable, so the reference stays valid while other
+     * workers insert their own entries. */
+    return *slot;
+}
+
+void clearPreciseScratchPool()
+{
+    std::lock_guard<std::mutex> lock(g_scratchMutex);
+    g_scratches.clear();
+}
 
 /*
  * G0: the perlin is evaluated by lowyd::samplePerlinTable(), which is bit-identical to
@@ -246,7 +272,8 @@ bool passCaveClimate(const BiomeNoise *bn, int bx, int bz, uint32_t sample_flags
     return passCoarseCaveCell(bn, bx, bz, sample_flags);
 }
 
-void samplePreciseCell(const Generator *g, int worldX, int worldZ, int *riverHits, int *caveHits)
+void samplePreciseCell(const Generator *g, int worldX, int worldZ,
+                       const lowyd::PreciseYRange &yRange, int *riverHits, int *caveHits)
 {
     *riverHits = 0;
     *caveHits = 0;
@@ -256,38 +283,30 @@ void samplePreciseCell(const Generator *g, int worldX, int worldZ, int *riverHit
     if (!passCaveClimate(&g->bn, bx, bz, COARSE_SAMPLE_FLAGS))
         return;
 
-    // Reuse a thread-local 1×1×sy cache instead of alloc/free per Y sample.
-    const int y0 = PRECISE_YS[0];
-    const int sy = PRECISE_YS[PRECISE_Y_COUNT - 1] - y0 + 1;
-    Range r = {1, worldX, worldZ, 1, 1, y0, sy};
+    // One column over the requested layer window, reusing this thread's cache.
+    const int y0 = yRange.yMin;
+    const int layers = yRange.count();
+    Range r = {1, worldX, worldZ, 1, 1, y0, layers};
 
-    thread_local int *tlsCache = nullptr;
-    thread_local size_t tlsCap = 0;
+    PreciseScratch &scratch = preciseScratch();
     const size_t need = getMinCacheSize(g, r.scale, r.sx, r.sy, r.sz);
     if (need == 0)
         return;
-    if (tlsCap < need)
-    {
-        free(tlsCache);
-        tlsCache = (int *) calloc(need, sizeof(int));
-        tlsCap = tlsCache ? need : 0;
-    }
-    if (!tlsCache)
+    if (scratch.cache.size() < need)
+        scratch.cache.resize(need);
+    if (genBiomes(g, scratch.cache.data(), r) != 0)
         return;
 
-    if (genBiomes(g, tlsCache, r) != 0)
-        return;
-
-    for (int i = 0; i < PRECISE_Y_COUNT; i++)
+    for (int i = 0; i < layers; i++)
     {
-        const int yi = PRECISE_YS[i] - y0;
-        const int id = tlsCache[yi];
+        const int id = scratch.cache[(size_t) i];
         *riverHits += (id == river);
         *caveHits += (id == dripstone_caves);
     }
 }
 
 void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
+                       const lowyd::PreciseYRange &yRange,
                        std::vector<int> &rawRiver, std::vector<int> &rawCave)
 {
     const size_t n = (size_t) W * (size_t) H;
@@ -296,9 +315,16 @@ void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
     if (W <= 0 || H <= 0)
         return;
 
-    std::vector<uint8_t> climatePass(n, 0);
-    std::unordered_map<uint64_t, uint8_t> climCache;
-    climCache.reserve((size_t) (W / 4 + 2) * (size_t) (H / 4 + 2));
+    /* B2: every buffer below is this thread's, sized once and reused for the
+     * next candidate instead of being allocated 7..8 times per candidate. */
+    PreciseScratch &scratch = preciseScratch();
+    std::vector<uint8_t> &climatePass = scratch.climatePass;
+    climatePass.assign(n, 0);
+    std::unordered_map<uint64_t, uint8_t> &climCache = scratch.climCache;
+    climCache.clear();
+    const size_t wantedBuckets = (size_t) (W / 4 + 2) * (size_t) (H / 4 + 2);
+    if (climCache.bucket_count() < wantedBuckets)
+        climCache.reserve(wantedBuckets);
 
     bool anyPass = false;
     for (int z = 0; z < H; z++)
@@ -323,17 +349,17 @@ void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
     if (!anyPass)
         return;
 
-    const int y0 = PRECISE_YS[0];
-    const int sy = PRECISE_YS[PRECISE_Y_COUNT - 1] - y0 + 1;
-    Range r = {1, startX, startZ, W, H, y0, sy};
-    int *cache = allocCache(g, r);
-    if (!cache)
+    const int layers = yRange.count();
+    Range r = {1, startX, startZ, W, H, yRange.yMin, layers};
+
+    const size_t need = getMinCacheSize(g, r.scale, r.sx, r.sy, r.sz);
+    if (need == 0)
         return;
+    if (scratch.cache.size() < need)
+        scratch.cache.resize(need);
+    int *cache = scratch.cache.data();
     if (genBiomes(g, cache, r) != 0)
-    {
-        free(cache);
         return;
-    }
 
     const size_t plane = n;
     for (int z = 0; z < H; z++)
@@ -345,10 +371,9 @@ void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
                 continue;
             int riverHits = 0;
             int caveHits = 0;
-            for (int i = 0; i < PRECISE_Y_COUNT; i++)
+            for (int i = 0; i < layers; i++)
             {
-                const int yi = PRECISE_YS[i] - y0;
-                const int id = cache[(size_t) yi * plane + idx];
+                const int id = cache[(size_t) i * plane + idx];
                 riverHits += (id == river);
                 caveHits += (id == dripstone_caves);
             }
@@ -356,5 +381,4 @@ void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
             rawCave[idx] = caveHits;
         }
     }
-    free(cache);
 }

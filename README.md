@@ -18,7 +18,11 @@
 JNI 契约（`LowYDripstoneCaveFinderBridge`）与旧版保持兼容，并新增一个
 **独立**的 weirdness 接口：
 
-- `riverSearch(...)`：每次命中 5 个 int：`x, z, total, cave, river`；无结果返回 `null`。
+- `riverSearch(seed, startX, startZ, width, height, yMin, yMax, coarseY, minArea,
+  preserveRange, riverWeight, numThreads, mcVersion, contScale, weirdScale,
+  searchMode, allowGpu)`：每次命中 5 个 int：`x, z, total, cave, river`；无结果返回 `null`。
+  `yMin..yMax` 为精采样层范围（跨度 1..48）；`coarseY` 仅为协议保留字段——本引擎
+  的粗筛气候门与 Y 无关。
 - `getSearchProgress()`：返回 `[current, total, phase, status, tryPause, tryStop]`。
 - `getNowResult()`：与 `riverSearch` 相同的扁平布局。
 - `pause()` / `resume()` / `stop()`。
@@ -91,6 +95,10 @@ cmake --build build --target DripstoneCaveFinderLibJ
 
 # 只计算 weirdness y-offset（独立接口）
 .\build\cli\lowydripstonecavefinder-cli.exe --weirdness-y-offset 12345
+
+# 自定义精采样层范围（默认 -63..-51；跨度上限 48 层）
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --square 131072 `
+    --y-min -60 --y-max -52 --out y9.txt
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -102,6 +110,8 @@ cmake --build build --target DripstoneCaveFinderLibJ
 | `--square <side>` | 未设置 | 以 (0,0) 为中心的正方形；不能与显式边界同用 |
 | `--min-area` | fast/precise `34748`，pit `44676` | 加权总面积下限（满值 49640） |
 | `--river-weight <float>` | `0.75` | `total = cave + river * weight`，范围 `[0,1]` |
+| `--y-min` / `--y-max` | `-63` / `-51` | 精采样层范围；`yMax-yMin+1` 必须 ≤ 48，越界或倒置直接报错 |
+| `--coarse-y` | `-51` | 粗筛召回高度；本引擎粗筛与 Y 无关，仅为协议兼容保留 |
 | `--threads` | CPU 数 | 1–256 |
 | `--limit` | `0` | 最多输出条数；0 表示全部 |
 | `--out <file>` | 未设置 | 同时把同一份文本报告写入 txt |
@@ -117,8 +127,51 @@ cmake --build build --target DripstoneCaveFinderLibJ
 /tp x 64 z s=total/49640 = pct% cave=N river=M
 ```
 
+报告头部现在带模型与层范围，切换模型/层数后结果不可比：
+
+```text
+# model=drowned-weighted-volume-b/13 y=[-63,-51] L=13 coarseY=-51
+```
+
 pit 模式省略 `cave` / `river`。结果先按 (x,z) 去重，再在每个 64×64 区块保留
 加权总面积最大的点，最后按总面积降序输出，与 Java GUI 的显示过滤一致。
+
+### 层范围与体积积分（B1）
+
+旧版只读 `-60/-56/-52` 三层并做“多数票压 0/1”。现在：
+
+- 逐层采样 `yMin..yMax`（默认 13 层），`fillPreciseWindow` 的 `sy = L`；
+- 计分改为**体积积分**：`total = round((Σcave + w·Σriver) / L)`，`cave`/`river`
+  也取逐层平均，因此分数保持 `0..49640`，`minArea`、剪枝和排序语义不变；
+- `L > 48` 属于硬错误（窗口缓存约 `320×320×L×4 B`，且 128 格球壳模型不再成立）；
+- 与 C（river-native）是同一模型的不同单位：B 用等效溶洞格，
+  `C = B / 0.69620`（`w = 0.6962` 时）。
+
+`model` 标识随层数变化，`done`/导出必须携带。
+
+## 回归测试（B4）
+
+`tests/` 里是从 C 项目（`river-native/tests/`）搬来的冻结参照与解析用例：
+
+| 用例 | 内容 |
+| --- | --- |
+| `volume_unit` | 体积积分解析用例（k/L 层满覆盖 ⇒ `round(49640·k/L)`）、层范围硬校验、model id |
+| `column_reference` | 8 版本 × 1 种子 × 3 个 3×3×13 窗口，共 2808 格逐格比对；另验证 `genBiomes` 与 `getBiomeAt` 逐格一致 |
+
+运行（无需 CMake，与正式构建同一套 MSYS2 工具链）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\run_tests_msys2.ps1
+```
+
+也可以走 CTest：
+
+```powershell
+cmake -S . -B build\tests -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    -DLOWYDRIPSTONE_BUILD_CLI=OFF -DLOWYDRIPSTONE_BUILD_JNI=OFF `
+    -DLOWYDRIPSTONE_BUILD_TESTS=ON
+ctest --test-dir build\tests --output-on-failure
+```
 
 ## 搜索流程 / Search Pipeline
 
@@ -233,13 +286,13 @@ Each surviving ring center is re-checked at a 4-block step
 down to a specific block. This stage evaluates climate only, not full biomes.
 
 **步骤 4 · 1:1 完整群系评分 / Step 4 · Full-biome scoring at 1:1.** 在候选点周围
-320×320 的窗口内，以 1:1 采样 Y = -60、-56、-52 三层的真实群系（`PRECISE_YS`），
-统计滴水石洞穴与河流的加权面积。明显过小的结果被剔除，其余按总面积降序输出。
+320×320 的窗口内，以 1:1 逐层采样 `[yMin, yMax]` 的真实群系（默认 13 层），
+把洞穴/河流计数按体积积分取逐层平均。明显过小的结果被剔除，其余按总面积降序输出。
 
-In a 320×320 window around each candidate, sample the real biomes at 1:1 on
-Y = -60, -56, -52 (`PRECISE_YS`) and measure the weighted dripstone-cave and river
-area. Results that are obviously too small are dropped; the rest are emitted in
-descending total area.
+In a 320×320 window around each candidate, sample the real biomes at 1:1 on every
+layer in `[yMin, yMax]` (13 by default) and aggregate the cave/river counts as a
+per-layer volume integral. Results that are obviously too small are dropped; the rest
+are emitted in descending total area.
 
 ### 大坑全图搜索步骤 / Large-pit search steps
 
@@ -308,13 +361,13 @@ Re-check the climate at a 4-block step in a 512×512 window around the peak to c
 the cave area is large enough.
 
 **步骤 5 · 1:1 完整群系评分 / Step 5 · Full-biome scoring at 1:1.** 在同一 512×512
-窗口内按 1:1 采样 Y = -60、-56、-52 三层的真实群系，达标才输出。步骤 4–5 的耗时
-从几秒到几分钟不等，取决于步骤 2 的结果数：结果越多，越可能藏着全图最大的溶洞。
+窗口内按 1:1 逐层采样 `[yMin, yMax]` 的真实群系，按体积积分取逐层平均，达标才输出。
+步骤 4–5 的耗时从几秒到几分钟不等，取决于步骤 2 的结果数：结果越多，越可能藏着全图最大的溶洞。
 
-The same 512×512 window is sampled at 1:1 on Y = -60, -56, -52, and only qualifying
-results are emitted. Stages 4–5 take anywhere from seconds to minutes depending on how
-many peaks survived step 2: the more survivors, the better the chance that the map's
-largest cave is among them.
+The same 512×512 window is sampled at 1:1 on every layer in `[yMin, yMax]`, aggregated
+as a per-layer volume integral; only qualifying results are emitted. Stages 4–5 take
+anywhere from seconds to minutes depending on how many peaks survived step 2: the more
+survivors, the better the chance that the map's largest cave is among them.
 
 ### 种子是否适合大坑搜索 / Is a seed worth the pit search
 
@@ -389,9 +442,25 @@ cxx_compat/pre_cubiomes.h          C++20 std::lerp 兼容处理
 lowydripstonecavefinder_cli.cpp    独立 CLI
 jni/                               JNI 桥接与签入头文件
 cubiomes/                          嵌套 git 子模块
+tests/                             冻结参照回归 + 体积积分解析用例（B4）
 build_jni_msys2.ps1                MSYS2 构建 JNI DLL
 build_cli_msys2.ps1                MSYS2 构建独立 exe
 ```
+
+## 未发布变更（层范围 + 体积积分，B1–B6）
+
+| 项 | 内容 |
+| --- | --- |
+| **B6** | `search()` 复用 `Generator`（只随 `mc` 重建），批量搜索省掉每个种子约 0.29 s 的 `setupGenerator` |
+| **B1** | `SearchParams` 新增 `yMin`/`yMax`/`coarseY` 与 `validate()`；精采样逐层跑满 `yMin..yMax`；计分改为体积积分（逐层平均，仍为 0..49640）；跨度上限 48 层 |
+| **B3** | Java GUI 两页传 `riverWeight = 0.7`；base 默认仍为 `0.75` |
+| **B2** | 精采样缓冲按“线程 → 本次搜索”复用（`PreciseScratch`），不再每个候选分配 7~8 次；缓冲由引擎统一释放，避免线程退出时释放导致堆损坏 |
+| **B4** | `tests/` 加入 C 项目的 2808 格冻结参照与体积积分解析用例 |
+| 构建 | `buildNativeMsys2`/`buildCliMsys2` 声明真实源码输入，头文件改动不再被 Gradle 误判为 UP-TO-DATE |
+| 模型 | `model=drowned-weighted-volume-b/{L}` 写入 CLI 报告与 GUI 导出 |
+
+注意：v1.1 的三层多数票结果与 v1.2 的体积积分结果**不可比**；Gui 默认占比为 70%
+（见主 README），按需调低可复现更接近旧模型的命中数量。
 
 ## 1.1.0 变更（CPU 优化一期 C0–C3）
 

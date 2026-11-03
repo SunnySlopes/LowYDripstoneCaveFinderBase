@@ -1,4 +1,4 @@
-﻿#include "lowydripstonecavefinder.h"
+#include "lowydripstonecavefinder.h"
 
 #include "cubiomes/generator.h"
 #include "cubiomes/biomes.h"
@@ -255,9 +255,10 @@ static bool gpuCoarseCells(
 }
 
 static void fillPreciseGrid(Generator *g, int startX, int startZ, int W, int H,
+                            const lowyd::PreciseYRange &yRange,
                             std::vector<int> &rawRiver, std::vector<int> &rawCave)
 {
-    fillPreciseWindow(g, startX, startZ, W, H, rawRiver, rawCave);
+    fillPreciseWindow(g, startX, startZ, W, H, yRange, rawRiver, rawCave);
 }
 
 struct Point {
@@ -294,7 +295,8 @@ std::vector<Res> findBiggestRiver(
     float riverWeight = 0.7f,
     const std::vector<uint8_t> *contPrefilter = nullptr,
     int contPrefilterScale = 0,
-    const std::vector<uint8_t> *coarseCells = nullptr) noexcept
+    const std::vector<uint8_t> *coarseCells = nullptr,
+    const lowyd::PreciseYRange &yRange = lowyd::PreciseYRange{}) noexcept
 {
     std::vector<Res> result;
     const int W = sx / scale;
@@ -304,17 +306,27 @@ std::vector<Res> findBiggestRiver(
     const int preW = (contPrefilter && contPrefilterScale > 0) ? (sx / contPrefilterScale) : 0;
     const int preH = (contPrefilter && contPrefilterScale > 0) ? (sz / contPrefilterScale) : 0;
 
+    /* B2: one set of per-thread buffers for every candidate of this worker. */
+    PreciseScratch &scratch = preciseScratch();
+    std::vector<int> &rawRiver = scratch.rawRiver;
+    std::vector<int> &prefixRiver = scratch.prefixRiver;
+    std::vector<int> &rawCave = scratch.rawCave;
+    std::vector<int> &prefixCave = scratch.prefixCave;
+
     const int stride = W + 1;
-    std::vector<int> rawRiver((size_t) W * H, 0);
-    std::vector<int> prefixRiver((size_t) (W + 1) * (H + 1), 0);
+    rawRiver.assign((size_t) W * H, 0);
+    prefixRiver.assign((size_t) (W + 1) * (H + 1), 0);
 
     // Cave grids only needed for precise (scale==1) path.
-    std::vector<int> rawCave;
-    std::vector<int> prefixCave;
     if constexpr (scale == 1)
     {
         rawCave.assign((size_t) W * H, 0);
         prefixCave.assign((size_t) (W + 1) * (H + 1), 0);
+    }
+    else
+    {
+        rawCave.clear();
+        prefixCave.clear();
     }
 
 #define RAWR(x,z) rawRiver[(size_t)(x) + (size_t)(z) * W]
@@ -326,7 +338,8 @@ std::vector<Res> findBiggestRiver(
     const int occTile = std::max(8, R_out);
     const int oW = (W + occTile - 1) / occTile;
     const int oH = (H + occTile - 1) / occTile;
-    std::vector<uint8_t> occ((size_t) std::max(0, oW) * std::max(0, oH), 0);
+    std::vector<uint8_t> &occ = scratch.occ;
+    occ.assign((size_t) std::max(0, oW) * std::max(0, oH), 0);
 
     auto markOcc = [&](int x, int z) {
         if (oW <= 0 || oH <= 0) return;
@@ -411,7 +424,7 @@ std::vector<Res> findBiggestRiver(
             lowyd_bench::add(lowyd_bench::counters().weirdCells, weirdCells);
     } else
     {
-        fillPreciseGrid(g, startX, startZ, W, H, rawRiver, rawCave);
+        fillPreciseGrid(g, startX, startZ, W, H, yRange, rawRiver, rawCave);
         for (int z = 0; z < H; z++)
         {
             for (int x = 0; x < W; x++)
@@ -516,13 +529,14 @@ std::vector<Res> findBiggestRiver(
      * cell cost four increments, followed by one reconstruction pass. The write range
      * is clamped to the same [R_out, W-R_out-1] x [R_out, H-R_out-1] box the scan loop
      * reads, so the resulting mask is identical. */
-    std::vector<uint8_t> centerCand;
+    std::vector<uint8_t> &centerCand = scratch.centerCand;
+    std::vector<int32_t> &diff = scratch.diff;
     if constexpr (scale > 1)
     {
         centerCand.assign((size_t) W * (size_t) H, 0);
 
         const int diffStride = W + 1;
-        std::vector<int32_t> diff((size_t) diffStride * (size_t) (H + 1), 0);
+        diff.assign((size_t) diffStride * (size_t) (H + 1), 0);
         uint64_t naiveWrites = 0;
 
         for (int z = 0; z < H; z++)
@@ -590,11 +604,15 @@ std::vector<Res> findBiggestRiver(
 
             if constexpr (scale == 1)
             {
+                /* B1 volume integral (same model as C, different unit):
+                 * sumC/sumR are 0..49640*L; the reported score is the
+                 * per-layer average, so total stays 0..49640 and every
+                 * minArea / f prune / sort keeps its old meaning. */
                 const int sumR = ringSum(prefixRiver, cx, cz);
                 const int sumC = ringSum(prefixCave, cx, cz);
-                worldRiver = (sumR + 1) / 3;
-                worldCave = (sumC + 1) / 3;
-                worldTotal = worldCave + (int) (worldRiver * riverWeight);
+                worldRiver = worldCave = 0;
+                worldTotal = lowyd::aggregateLayerAverages(sumC, sumR, riverWeight, yRange.count(),
+                                                    &worldCave, &worldRiver);
             } else
             {
                 const int sum = ringSum(prefixRiver, cx, cz);
@@ -805,6 +823,9 @@ void findBiggestRiverParallelPool(
     std::vector<Rect> rects;
     for (int x = 0; x < sx; x += step)
     {
+        /* 超大范围下这里会构造数百万个批次；停止后不要再继续准备。 */
+        if (progress && progress->try_stop.load())
+            return;
         for (int z = 0; z < sz; z += step)
         {
             const int currentSx = std::min(chunkSize, sx - x);
@@ -829,6 +850,8 @@ void findBiggestRiverParallelPool(
     std::vector<Batch> batches;
     for (int i = 0; i < totalChunks;)
     {
+        if (progress && progress->try_stop.load())
+            return;
         int n = 1;
         if (gpu)
         {
@@ -851,6 +874,10 @@ void findBiggestRiverParallelPool(
     ThreadPool pool(numThreads);
     for (const Batch &batch: batches)
     {
+        /* 停止时不要再把剩余批次塞进队列：大批量范围下逐批 enqueue + 队列唤醒
+         * 本身就要花几十秒，期间搜索线程无法发布完成状态，界面会一直停在“停止中”。 */
+        if (progress && progress->try_stop.load())
+            break;
         pool.enqueue([&, batch, totalChunks, seedVal, contScale, weirdScale, gridScale, mcVer]() {
             if (progress)
             {

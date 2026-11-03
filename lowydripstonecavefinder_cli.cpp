@@ -87,6 +87,9 @@ struct Options {
     int minArea = 0;
     bool minAreaSet = false;
     double riverWeight = 0.75;
+    int yMin = lowyd::Y_DEFAULT_MIN;
+    int yMax = lowyd::Y_DEFAULT_MAX;
+    int coarseY = lowyd::COARSE_Y_DEFAULT;
     int threads = 0;
     int mode = lowyd::SEARCH_MODE_FAST;
 
@@ -150,6 +153,14 @@ void printUsage(std::ostream &os)
         "                          49640 (34748) for fast/precise and 90% (44676) for pit\n"
         "  --river-weight <float>  river area weight in total = cave + river * weight,\n"
         "                          default 0.75, range [0, 1]\n"
+        "  --y-min <int>           lowest sampled layer, default -63 (floor -63)\n"
+        "  --y-max <int>           highest sampled layer, default -51 (ceiling 319)\n"
+        "                          y-max - y-min + 1 must be <= 48 (hard limit);\n"
+        "                          the score is the per-layer average volume\n"
+        "  --coarse-y <int>        coarse-stage recall height, default -51.  The\n"
+        "                          climate prefilter is Y-independent in this\n"
+        "                          engine, so the value is carried for protocol\n"
+        "                          compatibility only\n"
         "  --threads <int>         worker threads, default min(CPU count, 256)\n"
         "\n"
         "Output:\n"
@@ -409,6 +420,24 @@ Options parseOptions(int argc, char **argv)
             if (options.riverWeight < 0.0 || options.riverWeight > 1.0)
                 usageError("--river-weight must be between 0 and 1");
         }
+        else if (arg == "--y-min")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parseInt(value, options.yMin))
+                usageError("invalid --y-min: " + std::string(value));
+        }
+        else if (arg == "--y-max")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parseInt(value, options.yMax))
+                usageError("invalid --y-max: " + std::string(value));
+        }
+        else if (arg == "--coarse-y")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parseInt(value, options.coarseY))
+                usageError("invalid --coarse-y: " + std::string(value));
+        }
         else if (arg == "--threads")
         {
             const std::string_view value = requireValue(argc, argv, i, arg);
@@ -488,6 +517,20 @@ void validateOptions(Options &options)
     if (options.minX < -kWorldLimit || options.maxX > kWorldLimit
         || options.minZ < -kWorldLimit || options.maxZ > kWorldLimit)
         usageError("search bounds must be within the world border (-30000000..30000000)");
+
+    /* B1: same hard rules as lowyd::validate(); the CLI rejects before the run. */
+    if (options.yMin > options.yMax)
+        usageError("--y-min must be <= --y-max");
+    if (options.yMin < lowyd::Y_LIMIT_MIN || options.yMax > lowyd::Y_LIMIT_MAX)
+        usageError("layer range must stay within [" + std::to_string(lowyd::Y_LIMIT_MIN) + ", "
+                   + std::to_string(lowyd::Y_LIMIT_MAX) + "]");
+    if (options.yMax - options.yMin + 1 > lowyd::Y_MAX_SPAN)
+        usageError("layer span must not exceed " + std::to_string(lowyd::Y_MAX_SPAN)
+                   + " layers (current " + std::to_string(options.yMax - options.yMin + 1)
+                   + "); the window cache and the shell model both stop holding");
+    if (options.coarseY < lowyd::Y_LIMIT_MIN || options.coarseY > lowyd::Y_LIMIT_MAX)
+        usageError("--coarse-y must stay within [" + std::to_string(lowyd::Y_LIMIT_MIN) + ", "
+                   + std::to_string(lowyd::Y_LIMIT_MAX) + "]");
 
     const long long rawWidth = static_cast<long long>(options.maxX) - options.minX + 1;
     const long long rawHeight = static_cast<long long>(options.maxZ) - options.minZ + 1;
@@ -613,6 +656,10 @@ std::string formatSearchReport(const Options &options, int startX, int startZ,
 {
     std::ostringstream out;
     out << "# LowYDripstoneCaveFinder CLI " << kCliVersion << "\n";
+    out << "# model=" << lowyd::modelId(options.yMin, options.yMax)
+        << " y=[" << options.yMin << "," << options.yMax << "]"
+        << " L=" << (options.yMax - options.yMin + 1)
+        << " coarseY=" << options.coarseY << "\n";
     out << "# engine=LowYDripstoneCaveFinderBase " << kEngineVersion
         << " seed=" << options.seed
         << " mc=" << mcDisplayName(options.mc) << "(" << options.mc << ")"
@@ -1061,6 +1108,9 @@ int run(int argc, char **argv)
     params.minArea = options.minArea;
     params.preserveRange = lowyd::DEFAULT_PRESERVE_RANGE;
     params.riverWeight = static_cast<float>(options.riverWeight);
+    params.yMin = options.yMin;
+    params.yMax = options.yMax;
+    params.coarseY = options.coarseY;
     params.numThreads = options.threads;
     params.mc = options.mc;
     params.searchMode = options.mode;
@@ -1083,6 +1133,7 @@ int run(int argc, char **argv)
               << options.minZ << "," << options.maxZ << "]"
               << " minArea=" << options.minArea
               << " riverWeight=" << options.riverWeight
+              << " y=[" << options.yMin << "," << options.yMax << "]"
               << " threads=" << options.threads << "\n";
 
     const auto started = std::chrono::steady_clock::now();

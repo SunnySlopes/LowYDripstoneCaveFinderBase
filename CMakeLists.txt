@@ -113,3 +113,13 @@ option(LOWYDRIPSTONE_BUILD_JNI "Build the libDripstoneCaveFinderLibJ JNI library
 if(LOWYDRIPSTONE_BUILD_JNI)
     add_subdirectory(jni)
 endif()
+
+# ---------------------------------------------------------------------------
+# B4: native regression tests (volume integral / layer window, frozen biome
+# reference TSV ported from the river-native project).
+# ---------------------------------------------------------------------------
+option(LOWYDRIPSTONE_BUILD_TESTS "Build the native regression tests (B4)" ON)
+if(LOWYDRIPSTONE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
