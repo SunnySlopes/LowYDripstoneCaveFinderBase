@@ -1,41 +1,50 @@
 # LowYDripstoneCaveFinderBase
 
-低 Y 滴水石洞穴 + 河流搜索核心。本仓库拥有**全部** C++ / cubiomes 计算代码；
-[cubiomes](https://github.com/xpple/cubiomes) 作为嵌套 git 子模块放在
-`cubiomes/`，因此可以独立构建，不依赖 Java 模块的源码树。
+低 Y 滴水石洞穴 + 河流搜索核心。本仓库包含全部 C++ / cubiomes 计算代码，
+cubiomes 作为嵌套 git 子模块放在 `cubiomes/`，可以独立构建，不依赖 Java 源码树。
 
 主仓库 [LowYDripstoneCaveFinderGUI](https://github.com/SunnySlopes/LowYDripstoneCaveFinderGUI)
-通过 git 子模块引用本仓库，只保留 Swing 界面、查询编排、阈值判断和页面跳转逻辑。
+通过 git 子模块引用本仓库；Java 端只负责界面、任务编排、阈值判断和页面跳转。
 
-## 产物与契约
+当前 GUI 发布版本为 **1.4.3**。
+
+## 计分模型
+
+对每个候选点 `(x, z)`：
+
+- 挂机点/球心：`(x, afkY, z)`，默认 `afkY = -40`，允许 `-64..320`；
+- 采样层：`yMin..yMax`，默认 `-63..-51`（13 层），跨度上限 48 层；
+- 每层 `dy = y - afkY`，只统计满足
+  `24² < dx² + dy² + dz² ≤ 128²` 的洞穴/河流格；
+- **球壳内的所有格都计入**，不做区块级过滤；
+- 逐层求和后取平均：
+
+```text
+total = round((Σcave + riverWeight × Σriver) / L)
+cave  = round(Σcave / L)
+river = round(Σriver / L)
+```
+
+`total` 以 `49659`（默认 AFK=-40 的满球壳格数）作为 GUI 显示标定；`riverWeight`
+范围 `[0,1]`。满面积溶洞的 total 为 49659，占比 100.00%。
+
+结果集模型标识：
+
+```text
+# model=drowned-weighted-shell-b/{L}/afk-40
+```
+
+层数、挂机 Y 或模型不同，结果不可直接比较。
+
+## 产物
 
 | 产物 | 路径 | 用途 |
 | --- | --- | --- |
-| 静态引擎库 | CMake 中的 `lowydripstonecavefinder-core` | CLI 与 JNI 共用的 C++ 引擎 |
-| 独立 CLI | `build/cli/lowydripstonecavefinder-cli.exe` | 纯命令行搜索 / weirdness，不依赖 Java / DLL |
-| JNI 动态库 | `build/native/libDripstoneCaveFinderLibJ.dll` | 供 Java GUI 查询 |
+| 静态引擎库 | CMake target `lowydripstonecavefinder-core` | CLI 与 JNI 共用 |
+| 独立 CLI | `build/cli/lowydripstonecavefinder-cli.exe` | 命令行搜索 / 点位诊断 / weirdness |
+| JNI 动态库 | `build/native/libDripstoneCaveFinderLibJ.dll` | 供 Java GUI 调用 |
 
-JNI 契约（`LowYDripstoneCaveFinderBridge`）与旧版保持兼容，并新增一个
-**独立**的 weirdness 接口：
-
-- `riverSearch(seed, startX, startZ, width, height, yMin, yMax, coarseY, minArea,
-  preserveRange, riverWeight, numThreads, mcVersion, contScale, weirdScale,
-  searchMode, allowGpu)`：每次命中 5 个 int：`x, z, total, cave, river`；无结果返回 `null`。
-  `yMin..yMax` 为精采样层范围（跨度 1..48）；`coarseY` 仅为协议保留字段——本引擎
-  的粗筛气候门与 Y 无关。
-- `getSearchProgress()`：返回 `[current, total, phase, status, tryPause, tryStop]`。
-- `getNowResult()`：与 `riverSearch` 相同的扁平布局。
-- `pause()` / `resume()` / `stop()`。
-- `weirdnessYOffset(long seed)`：返回种子奇异值 y-offset 分数。
-  阈值（`0.75` / `0.85`）比较以及是否跳转“快速单种子搜索”页面的判断
-  **全部留在 Java 主模块**。
-
-`jni/generated/sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge.h`
-是签入的 JNI 头文件，使本仓库不依赖 Java 源码即可构建。修改
-`LowYDripstoneCaveFinderBridge.java` 后需要重新生成并同步该头文件；主模块的
-`verifyJniContract` Gradle 任务会检查两边是否一致。
-
-## 子模块与构建
+## 构建
 
 首次克隆后初始化嵌套子模块：
 
@@ -43,18 +52,16 @@ JNI 契约（`LowYDripstoneCaveFinderBridge`）与旧版保持兼容，并新增
 git submodule update --init --recursive
 ```
 
-本仓库也可以由主模块的 Gradle 构建直接调用
-（`:lowydripstonecavefinderbase:copyNativeArtifacts` /
-`:lowydripstonecavefinderbase:copyCliArtifact`）。
+主模块 Gradle 会自动调用本仓库的 `copyNativeArtifacts` / `copyCliArtifact`。
 
-### 独立 CLI（推荐）
+### 独立 CLI
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build_cli_msys2.ps1
 .\build\cli\lowydripstonecavefinder-cli.exe --help
 ```
 
-也可以使用 CMake：
+或使用 CMake：
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -62,8 +69,7 @@ cmake --build build
 .\build\bin\lowydripstonecavefinder-cli.exe --help
 ```
 
-MinGW 下 exe 静态链接 cubiomes 和 C++ 运行库，可以直接复制到其他 Windows
-机器运行。
+MinGW 下 exe 静态链接 cubiomes 和 C++ 运行库，可直接复制运行。
 
 ### JNI 库
 
@@ -71,34 +77,34 @@ MinGW 下 exe 静态链接 cubiomes 和 C++ 运行库，可以直接复制到其
 powershell -ExecutionPolicy Bypass -File build_jni_msys2.ps1
 ```
 
-产物为 `build/native/libDripstoneCaveFinderLibJ.dll`。也可以使用 CMake：
+或：
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target DripstoneCaveFinderLibJ
 ```
 
-## 命令行用法
+## 命令行
 
 ```powershell
-# 默认快速模式，131072 x 131072 区域，结果同时写入 txt
+# 默认快速模式，131072 × 131072 区域
 .\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --out result.txt
 
-# 精确模式 + 正方区域
+# 精确模式 + 正方形区域
 .\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --mode precise `
     --square 262144 --out precise.txt
 
-# 大坑模式（全图，按用户区域裁剪）
+# 大坑模式
 .\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --mode pit `
     --min-x -30000000 --max-x 30000000 --min-z -30000000 --max-z 30000000 `
     --out pit.txt
 
-# 只计算 weirdness y-offset（独立接口）
-.\build\cli\lowydripstonecavefinder-cli.exe --weirdness-y-offset 12345
-
-# 自定义精采样层范围（默认 -63..-51；跨度上限 48 层）
+# 自定义采样层与挂机 Y
 .\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --square 131072 `
-    --y-min -60 --y-max -52 --out y9.txt
+    --y-min -60 --y-max -52 --afk-y -40 --out y9.txt
+
+# weirdness y-offset（独立接口）
+.\build\cli\lowydripstonecavefinder-cli.exe --weirdness-y-offset 12345
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -108,74 +114,85 @@ cmake --build build --target DripstoneCaveFinderLibJ
 | `--mc <id\|version>` | `26.3` | 版本名、`1.18~26.1`、`26.2+` 或 cubiomes `MCVersion` 数值 |
 | `--min-x` / `--max-x` / `--min-z` / `--max-z` | `-65536..65535` | 用户搜索区域（含端点） |
 | `--square <side>` | 未设置 | 以 (0,0) 为中心的正方形；不能与显式边界同用 |
-| `--min-area` | fast/precise `34748`，pit `44676` | 加权总面积下限（满值 49640） |
+| `--min-area` | fast/precise `34761`，pit `44693` | 加权总面积下限（满值 49659） |
 | `--river-weight <float>` | `0.75` | `total = cave + river * weight`，范围 `[0,1]` |
-| `--y-min` / `--y-max` | `-63` / `-51` | 精采样层范围；`yMax-yMin+1` 必须 ≤ 48，越界或倒置直接报错 |
-| `--coarse-y` | `-51` | 粗筛召回高度；本引擎粗筛与 Y 无关，仅为协议兼容保留 |
+| `--y-min` / `--y-max` | `-63` / `-51` | 采样层范围；跨度必须 ≤ 48，越界或倒置直接报错 |
+| `--afk-y` | `-40` | 挂机/玩家 Y；球壳中心为 `(x, afk-y, z)` |
+| `--coarse-y` | `-51` | 粗筛召回高度；粗筛气候门与 Y 无关，仅保留协议字段 |
 | `--threads` | CPU 数 | 1–256 |
 | `--limit` | `0` | 最多输出条数；0 表示全部 |
-| `--out <file>` | 未设置 | 同时把同一份文本报告写入 txt |
-| `--bench` | 未设置 | 运行结束后向 **stderr** 输出分阶段计时（阶段 0 / Cont 掩膜 / Weird 环扫 / ClimateCoarse / 阶段 2）、工作量计数与进程峰值工作集 |
-| `--weirdness-y-offset <seed>` | 未设置 | 只输出 `weirdnessYOffset(seed)` 分数 |
+| `--out <file>` | 未设置 | 同时写入文本报告 |
+| `--bench` | 未设置 | 向 stderr 输出分阶段计时、工作量与峰值内存 |
+| `--weirdness-y-offset <seed>` | 未设置 | 只输出 `weirdnessYOffset(seed)` |
 | `--help` / `-h` | — | 显示帮助 |
 | `--version` | — | 显示版本 |
 
-文本报告同时打印到 stdout；指定 `--out` 时再写入文件。搜索报告每行与 GUI
-导出一致：
+### 点位诊断
 
-```text
-/tp x 64 z s=total/49640 = pct% cave=N river=M
-```
+这些参数替代搜索，只计算一个点，适合复现结果和比较模型：
 
-报告头部现在带模型与层范围，切换模型/层数后结果不可比：
-
-```text
-# model=drowned-weighted-volume-b/13 y=[-63,-51] L=13 coarseY=-51
-```
-
-pit 模式省略 `cave` / `river`。结果先按 (x,z) 去重，再在每个 64×64 区块保留
-加权总面积最大的点，最后按总面积降序输出，与 Java GUI 的显示过滤一致。
-
-### 层范围与体积积分（B1）
-
-旧版只读 `-60/-56/-52` 三层并做“多数票压 0/1”。现在：
-
-- 逐层采样 `yMin..yMax`（默认 13 层），`fillPreciseWindow` 的 `sy = L`；
-- 计分改为**体积积分**：`total = round((Σcave + w·Σriver) / L)`，`cave`/`river`
-  也取逐层平均，因此分数保持 `0..49640`，`minArea`、剪枝和排序语义不变；
-- `L > 48` 属于硬错误（窗口缓存约 `320×320×L×4 B`，且 128 格球壳模型不再成立）；
-- 与 C（river-native）是同一模型的不同单位：B 用等效溶洞格，
-  `C = B / 0.69620`（`w = 0.6962` 时）。
-
-`model` 标识随层数变化，`done`/导出必须携带。
-
-## 回归测试（B4）
-
-`tests/` 里是从 C 项目（`river-native/tests/`）搬来的冻结参照与解析用例：
-
-| 用例 | 内容 |
+| 参数 | 说明 |
 | --- | --- |
-| `volume_unit` | 体积积分解析用例（k/L 层满覆盖 ⇒ `round(49640·k/L)`）、层范围硬校验、model id |
-| `column_reference` | 8 版本 × 1 种子 × 3 个 3×3×13 窗口，共 2808 格逐格比对；另验证 `genBiomes` 与 `getBiomeAt` 逐格一致 |
-
-运行（无需 CMake，与正式构建同一套 MSYS2 工具链）：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests_msys2.ps1
-```
-
-也可以走 CTest：
+| `--score-point <x> <z>` | 以 1:1 采样给单点打分，输出 total/cave/river 与耗时 |
+| `--model shell\|cylinder` | `shell` 为当前 24–128 球壳；`cylinder` 为水平环对照 |
+| `--repeat <n>` | 计时重复次数，默认 5 |
+| `--sweep-afk-y <a> <b>` | 只采样一次生物群系，扫描 `[a,b]` 内每个挂机 Y，输出最佳 Y |
+| `--centroid` | 输出洞穴格质心与结果点的距离（visual/scored） |
 
 ```powershell
-cmake -S . -B build\tests -G Ninja -DCMAKE_BUILD_TYPE=Release `
-    -DLOWYDRIPSTONE_BUILD_CLI=OFF -DLOWYDRIPSTONE_BUILD_JNI=OFF `
-    -DLOWYDRIPSTONE_BUILD_TESTS=ON
-ctest --test-dir build\tests --output-on-failure
+REM 当前模型在该点：total=49659 cave=49659 river=0（100.00%）
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 `
+    --score-point 16043916 15695385 --model shell --repeat 5
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 `
+    --score-point 16043916 15695385 --sweep-afk-y -64 0
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 `
+    --score-point 16043916 15695385 --centroid
 ```
+
+`--model` 只影响点位诊断；完整搜索始终使用当前 `shell` 模型。
+
+### 报告格式
+
+```text
+/tp x -40 z s=total/49659 = pct% cave=N river=M
+```
+
+pit 模式省略 `cave` / `river`。`/tp` 的 y 值就是当前挂机 Y（默认 -40），可直接传送到球心所在高度。
+
+结果先按 `(x,z)` 去重，再在每个 64×64 区块保留加权总面积最大的点，最后按总面积降序输出，
+与 Java GUI 的显示过滤一致。报告头部携带模型标识：
+
+```text
+# model=drowned-weighted-shell-b/13/afk-40 y=[-63,-51] L=13 afkY=-40 coarseY=-51
+```
+
+## JNI 契约
+
+`LowYDripstoneCaveFinderBridge`：
+
+```java
+riverSearch(long seed, int startX, int startZ, int width, int height,
+            int yMin, int yMax, int coarseY, int afkY, int minArea,
+            float preserveRange, float riverWeight, int numThreads,
+            String mcVersion, int contScale, int weirdScale,
+            int searchMode, boolean allowGpu)
+```
+
+每次命中 5 个 `int`：`x, z, total, cave, river`；无结果返回 `null`。
+
+- `getSearchProgress()`：`[current, total, phase, status, tryPause, tryStop]`。
+- `getNowResult()`：与 `riverSearch` 相同的扁平布局。
+- `pause()` / `resume()` / `stop()`。
+- `weirdnessYOffset(long seed)`：返回种子奇异值 y-offset 分数；阈值比较与页面跳转由 Java 端负责。
+
+`jni/generated/sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge.h`
+是签入的 JNI 头文件；修改 Java 声明后需重新生成。主模块的 `verifyJniContract`
+任务会检查两边一致。
 
 ## 搜索流程 / Search Pipeline
 
-引擎不做全图蛮力采样：先用气候噪声的周期性把候选点压缩几个数量级，再用真实群系逐级确认。下面的阶段划分与 `--bench` 输出、源码一一对应。
+引擎不做全图逐格采样：先用气候噪声的周期性把候选点压缩几个数量级，再用真实群系逐级确认。
+下面的阶段划分与 `--bench` 输出、源码一一对应。
 
 The engine does not brute-force the map. It exploits the periodicity of the climate
 noise to shrink the candidate set by orders of magnitude first, then confirms the
@@ -286,29 +303,44 @@ Each surviving ring center is re-checked at a 4-block step
 down to a specific block. This stage evaluates climate only, not full biomes.
 
 **步骤 4 · 1:1 完整群系评分 / Step 4 · Full-biome scoring at 1:1.** 在候选点周围
-320×320 的窗口内，以 1:1 逐层采样 `[yMin, yMax]` 的真实群系（默认 13 层），
-把洞穴/河流计数按体积积分取逐层平均。明显过小的结果被剔除，其余按总面积降序输出。
+320×320 的窗口内，以 1:1 逐层采样 `[yMin, yMax]` 的真实群系（默认 13 层）。
+每层只统计以挂机点 `(x, -40, z)` 为球心的 24–128 球壳截面，球壳内全部洞穴/河流格
+都计入；逐层求和后取平均：
+
+```text
+total = round((Σcave + riverWeight × Σriver) / L)
+```
+
+明显过小的结果被剔除，其余按总面积降序输出。精算阶段用每层一张 2D 前缀表：
+`fillPreciseShellWindow()` 一次 `genBiomes` 覆盖 `yMin..yMax`，
+`findBiggestRiver<1>()` 对每层球壳截面求和。
 
 In a 320×320 window around each candidate, sample the real biomes at 1:1 on every
-layer in `[yMin, yMax]` (13 by default) and aggregate the cave/river counts as a
-per-layer volume integral. Results that are obviously too small are dropped; the rest
-are emitted in descending total area.
+layer in `[yMin, yMax]` (13 by default). Each layer counts only its 24–128 shell
+cross-section around `(x, -40, z)`; every cave/river cell inside the shell counts.
+The layer sums are averaged:
+
+```text
+total = round((Σcave + riverWeight × Σriver) / L)
+```
+
+Results that are obviously too small are dropped; the rest are emitted by total area.
 
 ### 大坑全图搜索步骤 / Large-pit search steps
 
 对应「快速单种子搜索」页与 CLI `--mode pit`。最完美的低 Y 溶洞往往不在河流下方：
 很难有大面积河流都那么深，而且深度 > 0.9 会强制转回地面群系。大坑（离河流最远的
 地方）反而常常是最好的选址：当奇异值绝对值峰值在 1.6–1.9 之间时，地表高度恰好
-合适，能在基岩层刷出半径 128 内满环的溶洞。这条路线通常比全图搜索快上百倍，
+合适，能在基岩层刷出 24–128 球壳内的溶洞。这条路线通常比全图搜索快上百倍，
 但对约 80% 的种子可能一个结果都找不到。
 
 This is the route behind the Fast Single Seed Search tab and `--mode pit`. The best
 low-Y caves often do not sit under rivers: large areas of deep river are rare, and
 depth > 0.9 forces the surface biome back to land. Large pits (the farthest points from
 rivers) are often the best sites instead: when the `|weirdness|` peak is between 1.6
-and 1.9, the surface height is just right for a full 128-block-radius ring of caves at
-bedrock level. This route is usually about two orders of magnitude faster than the
-full-map search, but for about 80% of seeds it may find nothing at all.
+and 1.9, the surface height is just right for caves inside the 24–128 shell at bedrock
+level. This route is usually about two orders of magnitude faster than the full-map
+search, but for about 80% of seeds it may find nothing at all.
 
 **步骤 0 · 缓存奇异值 A 表 / Step 0 · Cache the weirdness A tables.** 只缓存奇异值的
 `0A`、`1A`、`2A`，1 秒内完成。
@@ -361,13 +393,15 @@ Re-check the climate at a 4-block step in a 512×512 window around the peak to c
 the cave area is large enough.
 
 **步骤 5 · 1:1 完整群系评分 / Step 5 · Full-biome scoring at 1:1.** 在同一 512×512
-窗口内按 1:1 逐层采样 `[yMin, yMax]` 的真实群系，按体积积分取逐层平均，达标才输出。
-步骤 4–5 的耗时从几秒到几分钟不等，取决于步骤 2 的结果数：结果越多，越可能藏着全图最大的溶洞。
+窗口内按 1:1 逐层采样 `[yMin, yMax]` 的真实群系，每层按以 `(x, -40, z)` 为球心的
+24–128 球壳统计（球壳内全部计入），逐层平均，达标才输出。步骤 4–5 的耗时从几秒到
+几分钟不等，取决于步骤 2 的结果数：结果越多，越可能藏着全图最大的溶洞。
 
-The same 512×512 window is sampled at 1:1 on every layer in `[yMin, yMax]`, aggregated
-as a per-layer volume integral; only qualifying results are emitted. Stages 4–5 take
-anywhere from seconds to minutes depending on how many peaks survived step 2: the more
-survivors, the better the chance that the map's largest cave is among them.
+The same 512×512 window is sampled at 1:1 on every layer in `[yMin, yMax]`; each layer
+is scored over the 24–128 shell around `(x, -40, z)` with every cell counted, then the
+layers are averaged. Only qualifying results are emitted. Stages 4–5 take anywhere from
+seconds to minutes depending on how many peaks survived step 2: the more survivors,
+the better the chance that the map's largest cave is among them.
 
 ### 种子是否适合大坑搜索 / Is a seed worth the pit search
 
@@ -423,56 +457,47 @@ Chebyshev 写入次数、A 表体积与样本数），以及进程峰值工作�
 占比的分母是这个总和。
 
 > **精确模式的取舍**：A 周期表只为快速模式（Cont@128 + Weird@32）服务。
-> 精确模式（Cont@32 + Weird@16）会全量实时计算 A 八度，因此峰值内存从约
-> 1.75 GB 降到 <50 MB，但同一区域的耗时会比"带表"的实现更长。
-> 这一取舍见 1.4.0 的变更说明。
+> 精确模式（Cont@32 + Weird@16）实时计算八度，内存更省，但同一区域的耗时可能更长。
+
+
+## 回归测试
+
+`tests/` 包含：
+
+| 用例 | 内容 |
+| --- | --- |
+| `volume_unit` | 球壳几何（逐行半径/内孔/`|dy|>128`）、层范围/挂机 Y 校验、model id |
+| `column_reference` | 8 个版本 × 1 种子 × 3 个 3×3×13 窗口，共 2808 格逐格比对；另验证 `genBiomes` 与 `getBiomeAt` 一致 |
+
+运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\run_tests_msys2.ps1
+```
+
+或 CTest：
+
+```powershell
+cmake -S . -B build\tests -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    -DLOWYDRIPSTONE_BUILD_CLI=OFF -DLOWYDRIPSTONE_BUILD_JNI=OFF `
+    -DLOWYDRIPSTONE_BUILD_TESTS=ON
+ctest --test-dir build\tests --output-on-failure
+```
 
 ## 目录
 
 ```text
-lowydripstonecavefinder.h / .cpp   C++ 引擎与公开 API（含 weirdness 计算）
-dripstonecave_finder.cpp           扫描 / 精筛基础算法
-LargePitSearch.cpp                 全图大坑搜索
-BiomeSampler.cpp / .h              群系采样
-OctaveFieldCache.cpp / .h          Cont / Weirdness A 周期表
-Bench.h                            --bench 分阶段计时与工作量计数（C0）
-SearchConfig.h                     搜索参数常量
-Thread.h                           线程池与线程安全结果容器
-cxx_compat/pre_cubiomes.h          C++20 std::lerp 兼容处理
-lowydripstonecavefinder_cli.cpp    独立 CLI
-jni/                               JNI 桥接与签入头文件
-cubiomes/                          嵌套 git 子模块
-tests/                             冻结参照回归 + 体积积分解析用例（B4）
-build_jni_msys2.ps1                MSYS2 构建 JNI DLL
-build_cli_msys2.ps1                MSYS2 构建独立 exe
+BiomeSampler.*                真实群系采样、每层前缀表、精算 scratch
+dripstonecave_finder.cpp      球壳掩膜、精算/环扫、搜索主循环
+LargePitSearch.cpp            大坑链搜索
+lowydripstonecavefinder.*     公共 API、搜索编排、JNI 入口
+lowydripstonecavefinder_cli.cpp CLI 与点位诊断
+GpuCoarse.*                   OpenCL 粗筛
+SearchConfig.h                搜索参数
+tests/                        回归测试
+jni/                          JNI 桥接与签入头文件
+cubiomes/                     嵌套 git 子模块
 ```
-
-## 未发布变更（层范围 + 体积积分，B1–B6）
-
-| 项 | 内容 |
-| --- | --- |
-| **B6** | `search()` 复用 `Generator`（只随 `mc` 重建），批量搜索省掉每个种子约 0.29 s 的 `setupGenerator` |
-| **B1** | `SearchParams` 新增 `yMin`/`yMax`/`coarseY` 与 `validate()`；精采样逐层跑满 `yMin..yMax`；计分改为体积积分（逐层平均，仍为 0..49640）；跨度上限 48 层 |
-| **B3** | Java GUI 两页传 `riverWeight = 0.7`；base 默认仍为 `0.75` |
-| **B2** | 精采样缓冲按“线程 → 本次搜索”复用（`PreciseScratch`），不再每个候选分配 7~8 次；缓冲由引擎统一释放，避免线程退出时释放导致堆损坏 |
-| **B4** | `tests/` 加入 C 项目的 2808 格冻结参照与体积积分解析用例 |
-| 构建 | `buildNativeMsys2`/`buildCliMsys2` 声明真实源码输入，头文件改动不再被 Gradle 误判为 UP-TO-DATE |
-| 模型 | `model=drowned-weighted-volume-b/{L}` 写入 CLI 报告与 GUI 导出 |
-
-注意：v1.1 的三层多数票结果与 v1.2 的体积积分结果**不可比**；Gui 默认占比为 70%
-（见主 README），按需调低可复现更接近旧模型的命中数量。
-
-## 1.1.0 变更（CPU 优化一期 C0–C3）
-
-引擎版本 **1.0.0 → 1.1.0**，全部改动保持结果逐位一致（8 个 golden 组合
-fast/precise × 131072²…2000001² 结果行 diff = 0）：
-
-| 项 | 内容 |
-| --- | --- |
-| **C0** | 新增 `Bench.h` 与 CLI `--bench`：五阶段计时 + 工作量计数 + 峰值工作集 |
-| **C1** | A 周期表只服务快速模式：`buildOctaveACache()` 拒绝 Cont<128 / Weird<32；建表失败只降级为实时采样，不再让整次搜索返回空 |
-| **C2** | A 表索引由"每八度 2 次除法 + 2 次取模"改为"每样本 1 次探针 + 移位/掩码"，5（3）个八度共用一次格点判定 |
-| **C3** | `centerCand` 的 Chebyshev 膨胀由 `O(pass×(2R+1)²)` 写入改为 2D 差分数组 + 一次前缀重建 |
 
 ## 许可
 

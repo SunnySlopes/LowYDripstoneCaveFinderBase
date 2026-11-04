@@ -400,7 +400,8 @@ std::vector<Hit> search(const SearchParams &params)
         try
         {
             finallyResults = runLargePitSearch(&g, params.minArea, riverWeight, threads, &g_progress,
-                                               boxMinX, boxMaxX, boxMinZ, boxMaxZ, yRange);
+                                               boxMinX, boxMaxX, boxMinZ, boxMaxZ, yRange,
+                                               params.afkY);
         }
         catch (const std::bad_alloc &)
         {
@@ -604,7 +605,7 @@ std::vector<Hit> search(const SearchParams &params)
                             cand.point.y - SearchConfig::REFINE_HALF_WINDOW,
                             SearchConfig::REFINE_WINDOW_BLOCKS, SearchConfig::REFINE_WINDOW_BLOCKS,
                             minArea, 1.0, FilterMode::PreciseBiome, riverWeight,
-                            nullptr, 0, nullptr, yRange);
+                            nullptr, 0, nullptr, yRange, params.afkY);
 
                         if (!temp.empty() && temp[0].area >= minArea)
                             g_results.addResult(temp[0]);

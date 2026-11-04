@@ -17,12 +17,17 @@
 #include <string>
 #include <vector>
 
+/** cubiomes generator (defined by the nested submodule; only used by the CLI helper). */
+struct Generator;
+
 namespace lowyd {
 
 /** Ring geometry used by the Java GUI: results are 128 blocks around the area. */
 constexpr int RING_OUTER = 128;
-/** Cap for the weighted total (block-cell centers in the 24..128 annulus). */
-constexpr double RIVER_AREA_FULL = 49640.0;
+/** Inner no-spawn sphere used by the shell model (distance 24 around the AFK point). */
+constexpr int RING_INNER = 24;
+/** Display denominator: full 24..128 shell cell count at the default AFK Y=-40. */
+constexpr double RIVER_AREA_FULL = 49659.0;
 /** One maximum per 64x64 block cell when results are prepared for display. */
 constexpr int OUTPUT_REGION_SIZE = 64;
 
@@ -43,12 +48,11 @@ constexpr float DEFAULT_PRESERVE_RANGE = 0.9f;
 /*
  * Precise layer window (B1).
  *
- * The precise pass samples every layer in [yMin, yMax] and integrates the
- * counts as a volume: the per-layer average is reported, so every score keeps
- * the historical 0..49640 "effective cave cells" range.  The span is capped:
- * fillPreciseWindow() allocates 320x320xLx4 B per worker (19.7 MB at L=48) and
- * above L=48 the 128-block shell no longer covers a full layer, so the model
- * itself stops making sense.
+ * The precise pass samples every layer in [yMin, yMax] and scores the 24..128
+ * spherical shell around (x, afkY, z); the per-layer cross-sections are
+ * averaged, so every score is in the 0..49659 "effective cave cells" range.  The span is capped: the precise pass keeps two 320x320xL
+ * prefix planes per worker and above L=48 the 128-block shell no longer
+ * covers a full layer, so the model itself stops making sense.
  */
 constexpr int Y_LIMIT_MIN = -63;
 constexpr int Y_LIMIT_MAX = 319;
@@ -56,6 +60,14 @@ constexpr int Y_MAX_SPAN = 48;
 constexpr int Y_DEFAULT_MIN = -63;
 constexpr int Y_DEFAULT_MAX = -51;
 constexpr int COARSE_Y_DEFAULT = -51;
+/**
+ * AFK / player Y used by the shell model and by the /tp result line.  The
+ * scored region is the 3D shell 24 < distance <= 128 around
+ * (result x, afkY, result z).
+ */
+constexpr int AFK_Y_DEFAULT = -40;
+constexpr int AFK_Y_LIMIT_MIN = -64;
+constexpr int AFK_Y_LIMIT_MAX = 320;
 
 /** Layer range of the precise pass.  L = yMax - yMin + 1, capped at 1..Y_MAX_SPAN. */
 struct PreciseYRange {
@@ -72,27 +84,94 @@ struct PreciseYRange {
 };
 
 /**
- * Export / result tag including the aggregation model and the layer count,
- * e.g. "drowned-weighted-volume-b/13".  Results of different versions are not
- * comparable, so this must travel with every result set.
+ * Exact per-row radii of the 24..128 shell cross-section.
+ *
+ * For a layer dy and a dz row, block centres satisfy
+ * 24^2 < dx^2 + dy^2 + dz^2 <= 128^2, so
+ *   outer = floor(sqrt(128^2 - dy^2 - dz^2))
+ *   inner = floor(sqrt(24^2  - dy^2 - dz^2))  (>= 0 only inside the no-spawn sphere)
+ *
+ * @return false when this row is outside the shell.
+ */
+inline bool shellRowRadii(int dy, int dz, int &outer, int &inner)
+{
+    const long long dy2 = (long long) dy * (long long) dy;
+    const long long dz2 = (long long) dz * (long long) dz;
+    const long long out2 = (long long) RING_OUTER * RING_OUTER - dy2 - dz2;
+    if (out2 < 0)
+    {
+        outer = -1;
+        inner = -1;
+        return false;
+    }
+    outer = (int) std::floor(std::sqrt((double) out2));
+    const long long in2 = (long long) RING_INNER * RING_INNER - dy2 - dz2;
+    inner = in2 >= 0 ? (int) std::floor(std::sqrt((double) in2)) : -1;
+    return true;
+}
+
+/**
+ * Layer-level horizontal radii of the 24..128 shell cross-section (the dz=0 row).
+ *
+ * dy = layerY - afkY; the shell contains block centers with
+ * 24^2 < dx^2 + dy^2 + dz^2 <= 128^2, i.e. the per-layer annulus
+ * inner < sqrt(dx^2+dz^2) <= outer (inner < 0 means no hole).
+ *
+ * @return false when the layer is outside the shell (|dy| > 128).
+ */
+inline bool shellRingRadii(int layerY, int afkY, int &outer, int &inner)
+{
+    return shellRowRadii(layerY - afkY, 0, outer, inner);
+}
+
+/**
+ * river-native's platform (plateau) solution: when every sampled layer is
+ * within ±24 of the AFK Y, the 24..128 shell cross-section area is the same
+ * on every layer (the dy^2 term cancels), so the score does not depend on the
+ * exact AFK Y on that plateau.  This reproduces core/platform/player_y.hpp:
+ *   span <= 25 : yMin
+ *   span <= 49 : yMin + 24
+ *   span >  49 : (yMin + yMax) / 2
+ */
+inline int shellPlatformPlayerY(int yMin, int yMax)
+{
+    const int span = yMax - yMin + 1;
+    if (span <= 25)
+        return yMin;
+    if (span <= 49)
+        return yMin + 24;
+    return (yMin + yMax) / 2;
+}
+
+/** True when all sampled layers are within ±24 of playerY (the plateau). */
+inline bool onShellPlatform(int yMin, int yMax, int playerY)
+{
+    return playerY - yMin <= RING_INNER && yMax - playerY <= RING_INNER;
+}
+
+/**
+ * Export / result tag including the aggregation model, layer count and AFK Y.
+ * Results of different versions are not comparable, so this must travel with
+ * every result set.
  *
  * Header-inline: the All-In-One host includes the engine sources at global
  * scope and does not compile lowydripstonecavefinder.cpp, so shared helpers
  * must not live in that translation unit.
  */
-inline std::string modelId(int yMin, int yMax)
+inline std::string modelId(int yMin, int yMax, int afkY)
 {
     const int layers = yMax - yMin + 1;
-    return "drowned-weighted-volume-b/" + std::to_string(layers > 0 ? layers : 0);
+    return "drowned-weighted-shell-b/" + std::to_string(layers > 0 ? layers : 0)
+        + "/afk" + std::to_string(afkY);
 }
 
 /**
  * Volume-integral aggregation of one ring (B1).
  *
  * sumCave / sumRiver are the summed per-layer hit counts of the annulus,
- * range 0..49640*L.  Returns the weighted total as the per-layer average
- * (0..49640), so minArea, the refinement coefficient and sorting keep their
- * historical meaning.  caveAvg / riverAvg receive the unweighted per-layer
+ * range 0..49659*L.  Returns the weighted total as the per-layer average
+ * (0..49659), so minArea, the refinement coefficient and sorting keep their
+ * existing meaning.  caveAvg / riverAvg receive the unweighted per-layer
  * averages when non-null.
  */
 inline int aggregateLayerAverages(int sumCave, int sumRiver, float riverWeight, int layers,
@@ -164,10 +243,15 @@ struct SearchParams {
     /**
      * Precise layer window (B1).  yMax - yMin + 1 must be <= Y_MAX_SPAN; see
      * validate().  The score is the per-layer average of the cave/river volume,
-     * so it keeps the 0..49640 scale regardless of the layer count.
+     * so it keeps the 0..49659 scale regardless of the layer count.
      */
     int yMin = Y_DEFAULT_MIN;
     int yMax = Y_DEFAULT_MAX;
+    /**
+     * AFK / player Y of the shell model.  The scored region is the 3D shell
+     * 24 < distance <= 128 around (x, afkY, z) for every candidate (x, z).
+     */
+    int afkY = AFK_Y_DEFAULT;
     /**
      * Recall knob of the coarse stage.  The climate prefilter used by this
      * engine (continentalness + weirdness) is Y-independent, so the value is
@@ -189,9 +273,10 @@ struct SearchParams {
 };
 
 /**
- * Validates the layer window: yMin <= yMax, both inside [-63, 319], and
- * yMax - yMin + 1 <= Y_MAX_SPAN.  Returns false and fills *error (when non-null)
- * on failure; the GUI / CLI reject the search before calling search().
+ * Validates the layer window and the AFK Y: yMin <= yMax, both inside
+ * [-63, 319], yMax - yMin + 1 <= Y_MAX_SPAN, and afkY inside
+ * [-64, 320].  Returns false and fills *error (when non-null) on failure;
+ * the GUI / CLI reject the search before calling search().
  *
  * Header-inline for the All-In-One host (see modelId()).
  */
@@ -207,6 +292,10 @@ inline bool validate(const SearchParams &params, std::string *error)
         return false;
     };
 
+    if (params.afkY < AFK_Y_LIMIT_MIN || params.afkY > AFK_Y_LIMIT_MAX)
+        return fail("AFK Y must stay within [" + std::to_string(AFK_Y_LIMIT_MIN) + ", "
+                    + std::to_string(AFK_Y_LIMIT_MAX) + "] (got "
+                    + std::to_string(params.afkY) + ")");
     if (yMin > yMax)
         return fail("yMin (" + std::to_string(yMin) + ") must not be greater than yMax ("
                     + std::to_string(yMax) + ")");
@@ -243,6 +332,72 @@ bool stopRequested();
  * callers exactly like the historical JNI bridge.
  */
 std::vector<Hit> search(const SearchParams &params);
+
+/** Point-score coverage models, used for diagnostics and before/after comparisons. */
+enum PointCoverage
+{
+    /** Current model: the 24..128 shell, with no chunk-level culling. */
+    POINT_COVERAGE_SHELL = 0,
+    /** Pre-shell model: the full horizontal 24..128 annulus on every layer. */
+    POINT_COVERAGE_CYLINDER = 1
+};
+
+struct PointScore
+{
+    int total = 0;
+    int cave = 0;
+    int river = 0;
+};
+
+struct PointScoreAtY
+{
+    int afkY = 0;
+    PointScore score;
+};
+
+/** Cave-cell centroid (block coordinates) of one diagnostic point window. */
+struct PointCentroid
+{
+    double x = 0.0;
+    double z = 0.0;
+    int cells = 0;
+};
+
+struct PointCentroids
+{
+    /** All cave cells in the 128-block horizontal disk (the visual blob centre). */
+    PointCentroid visual;
+    /** Only the cells counted by the current shell score. */
+    PointCentroid scored;
+};
+
+/**
+ * Computes where the cave cells actually sit relative to the AFK point.  This
+ * explains why the score optimum can differ from the visual centre of the
+ * cave: the score excludes the 24-block inner sphere, so it is not a centroid
+ * objective.
+ */
+PointCentroids pointCaveCentroids(Generator *g, int x, int z,
+                                  const SearchParams &params);
+
+/**
+ * Scores one exact (x, z) point with the same 1:1 layer sampling as the
+ * precise pass.  The window is [x-128, x+128] x [z-128, z+128], so the whole
+ * 128 shell is visible.  g must already be seeded.  Used by the CLI's
+ * --score-point diagnostic; it is not part of the GUI search path.
+ */
+PointScore scorePoint(Generator *g, int x, int z, const SearchParams &params,
+                      int coverage = POINT_COVERAGE_SHELL);
+
+/**
+ * Scores one point for every AFK Y in [afkYFrom, afkYTo] while sampling the
+ * biome window only once.  This is how the platform plateau is verified on a
+ * real seed without repeating the expensive genBiomes call.
+ */
+std::vector<PointScoreAtY> sweepPointAfkY(Generator *g, int x, int z,
+                                          const SearchParams &params,
+                                          int coverage,
+                                          int afkYFrom, int afkYTo);
 
 /** Snapshot of results collected so far (empty once a search finished). */
 std::vector<Hit> getNowResults();

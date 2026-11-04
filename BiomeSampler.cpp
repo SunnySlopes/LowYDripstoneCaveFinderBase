@@ -305,13 +305,19 @@ void samplePreciseCell(const Generator *g, int worldX, int worldZ,
     }
 }
 
-void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
-                       const lowyd::PreciseYRange &yRange,
-                       std::vector<int> &rawRiver, std::vector<int> &rawCave)
+void fillPreciseShellWindow(Generator *g, int startX, int startZ, int W, int H,
+                            const lowyd::PreciseYRange &yRange,
+                            std::vector<int> &prefixRiver,
+                            std::vector<int> &prefixCave,
+                            std::vector<uint8_t> &hitMask)
 {
     const size_t n = (size_t) W * (size_t) H;
-    rawRiver.assign(n, 0);
-    rawCave.assign(n, 0);
+    const int layers = yRange.count();
+    const int stride = W + 1;
+    const size_t perLayer = (size_t) stride * (size_t) (H + 1);
+    prefixRiver.assign(perLayer * (size_t) layers, 0);
+    prefixCave.assign(perLayer * (size_t) layers, 0);
+    hitMask.assign(n, 0);
     if (W <= 0 || H <= 0)
         return;
 
@@ -349,7 +355,6 @@ void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
     if (!anyPass)
         return;
 
-    const int layers = yRange.count();
     Range r = {1, startX, startZ, W, H, yRange.yMin, layers};
 
     const size_t need = getMinCacheSize(g, r.scale, r.sx, r.sy, r.sz);
@@ -361,24 +366,39 @@ void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
     if (genBiomes(g, cache, r) != 0)
         return;
 
-    const size_t plane = n;
-    for (int z = 0; z < H; z++)
+    /* One 2D prefix plane per sampled layer: the shell cross-section differs
+     * per layer (dy = y - afkY), so a summed column total cannot be used. */
+    for (int layer = 0; layer < layers; layer++)
     {
-        for (int x = 0; x < W; x++)
+        const int *ids = cache + (size_t) layer * n;
+        int *prefixR = prefixRiver.data() + (size_t) layer * perLayer;
+        int *prefixC = prefixCave.data() + (size_t) layer * perLayer;
+        for (int z = 0; z < H; z++)
         {
-            const size_t idx = (size_t) x + (size_t) z * W;
-            if (!climatePass[idx])
-                continue;
-            int riverHits = 0;
-            int caveHits = 0;
-            for (int i = 0; i < layers; i++)
+            int rowRiver = 0;
+            int rowCave = 0;
+            const int *idRow = ids + (size_t) z * W;
+            const uint8_t *passRow = climatePass.data() + (size_t) z * W;
+            uint8_t *maskRow = hitMask.data() + (size_t) z * W;
+            int *curRiver = prefixR + (size_t) (z + 1) * stride;
+            int *prevRiver = prefixR + (size_t) z * stride;
+            int *curCave = prefixC + (size_t) (z + 1) * stride;
+            int *prevCave = prefixC + (size_t) z * stride;
+            for (int x = 0; x < W; x++)
             {
-                const int id = cache[(size_t) i * plane + idx];
-                riverHits += (id == river);
-                caveHits += (id == dripstone_caves);
+                if (passRow[x])
+                {
+                    const int id = idRow[x];
+                    const int isRiver = id == river;
+                    const int isCave = id == dripstone_caves;
+                    rowRiver += isRiver;
+                    rowCave += isCave;
+                    if (isRiver || isCave)
+                        maskRow[x] = 1;
+                }
+                curRiver[x + 1] = prevRiver[x + 1] + rowRiver;
+                curCave[x + 1] = prevCave[x + 1] + rowCave;
             }
-            rawRiver[idx] = riverHits;
-            rawCave[idx] = caveHits;
         }
     }
 }

@@ -38,30 +38,113 @@ struct RingMask {
     int R_out = 0;
 };
 
+/** Build a horizontal annulus mask with the given outer/inner radii. */
+static RingMask makeRingMask(int R_out, int R_in)
+{
+    RingMask m;
+    m.R_out = R_out;
+    if (R_out < 0)
+        return m;
+    m.rows.reserve((size_t) (2 * R_out + 1));
+    for (int dz = -R_out; dz <= R_out; dz++)
+    {
+        RingMask::Row row{};
+        row.dz = dz;
+        row.out = (int) std::floor(std::sqrt((double) R_out * R_out - (double) dz * dz));
+        row.in = (R_in >= 0 && std::abs(dz) <= R_in)
+            ? (int) std::floor(std::sqrt((double) R_in * R_in - (double) dz * dz))
+            : -1;
+        m.rows.push_back(row);
+    }
+    return m;
+}
+
+/**
+ * Exact per-row cross-section of the 24..128 sphere at one layer.
+ *
+ * For dy = layerY - afkY and each dz row:
+ *   outer = floor(sqrt(128^2 - dy^2 - dz^2))
+ *   inner = floor(sqrt(24^2  - dy^2 - dz^2))   (>=0 only inside the no-spawn sphere)
+ * This is the discrete block-centre condition 24^2 < dx^2 + dy^2 + dz^2 <= 128^2,
+ * matching the river-native kernel.  Empty when |dy| > 128.
+ */
+static RingMask makeShellMask(int dy)
+{
+    RingMask m;
+    const long long dy2 = (long long) dy * (long long) dy;
+    if (dy2 > (long long) lowyd::RING_OUTER * lowyd::RING_OUTER)
+        return m;
+    m.R_out = (int) std::floor(
+        std::sqrt((double) ((long long) lowyd::RING_OUTER * lowyd::RING_OUTER - dy2)));
+    m.rows.reserve((size_t) (2 * m.R_out + 1));
+    for (int dz = -lowyd::RING_OUTER; dz <= lowyd::RING_OUTER; dz++)
+    {
+        RingMask::Row row{};
+        row.dz = dz;
+        if (!lowyd::shellRowRadii(dy, dz, row.out, row.in))
+            continue;
+        m.rows.push_back(row);
+    }
+    return m;
+}
+
+/** 2D prefix sum of one row segment [left, right] (window coordinates). */
+static int rangeSumPref(const int *pref, int stride, int W, int row,
+                        int left, int right)
+{
+    left = std::max(0, left);
+    right = std::min(W - 1, right);
+    if (left > right)
+        return 0;
+    const size_t base1 = (size_t) (row + 1) * (size_t) stride;
+    const size_t base0 = (size_t) row * (size_t) stride;
+    return pref[base1 + (size_t) (right + 1)]
+         - pref[base1 + (size_t) left]
+         - pref[base0 + (size_t) (right + 1)]
+         + pref[base0 + (size_t) left];
+}
+
+/** Symmetric annulus sum from a 2D prefix plane. */
+static int ringSumPref(const int *prefData, int stride, const RingMask &mask,
+                       int cx, int cz)
+{
+    int area = 0;
+    for (const auto &m : mask.rows)
+    {
+        const int row = cz + m.dz;
+        const int row1 = row + 1;
+        const size_t base1 = (size_t) row1 * (size_t) stride;
+        const size_t base0 = (size_t) row * (size_t) stride;
+        const int L = cx - m.out;
+        const int R = cx + m.out;
+        if (m.in < 0)
+        {
+            area += prefData[base1 + (size_t) (R + 1)]
+                  - prefData[base1 + (size_t) L]
+                  - prefData[base0 + (size_t) (R + 1)]
+                  + prefData[base0 + (size_t) L];
+        }
+        else
+        {
+            const int Lin = cx - m.in;
+            const int Rin = cx + m.in;
+            area += prefData[base1 + (size_t) Lin]
+                  - prefData[base1 + (size_t) L]
+                  - prefData[base0 + (size_t) Lin]
+                  + prefData[base0 + (size_t) L];
+            area += prefData[base1 + (size_t) (R + 1)]
+                  - prefData[base1 + (size_t) (Rin + 1)]
+                  - prefData[base0 + (size_t) (R + 1)]
+                  + prefData[base0 + (size_t) (Rin + 1)];
+        }
+    }
+    return area;
+}
+
 template<int scale>
 static const RingMask &getRingMask()
 {
-    static const RingMask mask = [] {
-        RingMask m;
-        m.R_out = 128 / scale;
-        const int R_in = 24 / scale;
-        std::vector<int> dxOut(2 * m.R_out + 1);
-        std::vector<int> dxIn(2 * R_in + 1);
-        for (int dz = -m.R_out; dz <= m.R_out; dz++)
-            dxOut[dz + m.R_out] = (int) std::floor(std::sqrt((double) m.R_out * m.R_out - dz * dz));
-        for (int dz = -R_in; dz <= R_in; dz++)
-            dxIn[dz + R_in] = (int) std::floor(std::sqrt((double) R_in * R_in - dz * dz));
-        m.rows.reserve(2 * m.R_out + 1);
-        for (int dz = -m.R_out; dz <= m.R_out; dz++)
-        {
-            RingMask::Row row{};
-            row.dz = dz;
-            row.out = dxOut[dz + m.R_out];
-            row.in = (std::abs(dz) <= R_in) ? dxIn[dz + R_in] : -1;
-            m.rows.push_back(row);
-        }
-        return m;
-    }();
+    static const RingMask mask = makeRingMask(128 / scale, 24 / scale);
     return mask;
 }
 
@@ -254,13 +337,6 @@ static bool gpuCoarseCells(
                                cells, nullptr);
 }
 
-static void fillPreciseGrid(Generator *g, int startX, int startZ, int W, int H,
-                            const lowyd::PreciseYRange &yRange,
-                            std::vector<int> &rawRiver, std::vector<int> &rawCave)
-{
-    fillPreciseWindow(g, startX, startZ, W, H, yRange, rawRiver, rawCave);
-}
-
 struct Point {
     int x = 0;
     int y = 0;
@@ -296,7 +372,8 @@ std::vector<Res> findBiggestRiver(
     const std::vector<uint8_t> *contPrefilter = nullptr,
     int contPrefilterScale = 0,
     const std::vector<uint8_t> *coarseCells = nullptr,
-    const lowyd::PreciseYRange &yRange = lowyd::PreciseYRange{}) noexcept
+    const lowyd::PreciseYRange &yRange = lowyd::PreciseYRange{},
+    int afkY = lowyd::AFK_Y_DEFAULT) noexcept
 {
     std::vector<Res> result;
     const int W = sx / scale;
@@ -310,29 +387,28 @@ std::vector<Res> findBiggestRiver(
     PreciseScratch &scratch = preciseScratch();
     std::vector<int> &rawRiver = scratch.rawRiver;
     std::vector<int> &prefixRiver = scratch.prefixRiver;
-    std::vector<int> &rawCave = scratch.rawCave;
     std::vector<int> &prefixCave = scratch.prefixCave;
+    std::vector<uint8_t> &hitMask = scratch.hitMask;
 
     const int stride = W + 1;
-    rawRiver.assign((size_t) W * H, 0);
-    prefixRiver.assign((size_t) (W + 1) * (H + 1), 0);
+    const int layers = yRange.count();
+    const size_t perLayer = (size_t) stride * (size_t) (H + 1);
 
-    // Cave grids only needed for precise (scale==1) path.
-    if constexpr (scale == 1)
+    if constexpr (scale > 1)
     {
-        rawCave.assign((size_t) W * H, 0);
-        prefixCave.assign((size_t) (W + 1) * (H + 1), 0);
+        rawRiver.assign((size_t) W * H, 0);
+        prefixRiver.assign(perLayer, 0);
+        prefixCave.clear();
+        hitMask.clear();
     }
     else
     {
-        rawCave.clear();
-        prefixCave.clear();
+        /* The shell path fills one prefix plane per layer below. */
+        rawRiver.clear();
     }
 
 #define RAWR(x,z) rawRiver[(size_t)(x) + (size_t)(z) * W]
-#define RAWC(x,z) rawCave[(size_t)(x) + (size_t)(z) * W]
 #define ARRR(x,z) prefixRiver[(size_t)(x) + (size_t)(z) * stride]
-#define ARRC(x,z) prefixCave[(size_t)(x) + (size_t)(z) * stride]
 
     const int R_out = 128 / scale;
     const int occTile = std::max(8, R_out);
@@ -424,25 +500,25 @@ std::vector<Res> findBiggestRiver(
             lowyd_bench::add(lowyd_bench::counters().weirdCells, weirdCells);
     } else
     {
-        fillPreciseGrid(g, startX, startZ, W, H, yRange, rawRiver, rawCave);
+        fillPreciseShellWindow(g, startX, startZ, W, H, yRange,
+                               prefixRiver, prefixCave, hitMask);
         for (int z = 0; z < H; z++)
         {
             for (int x = 0; x < W; x++)
             {
-                if (RAWR(x, z) || RAWC(x, z))
+                if (hitMask[(size_t) x + (size_t) z * W])
                     markOcc(x, z);
             }
         }
     }
 
-    for (int z = 1; z <= H; z++)
+    if constexpr (scale > 1)
     {
-        for (int x = 1; x <= W; x++)
+        for (int z = 1; z <= H; z++)
         {
-            ARRR(x, z) = RAWR(x - 1, z - 1) + ARRR(x - 1, z) + ARRR(x, z - 1) - ARRR(x - 1, z - 1);
-            if constexpr (scale == 1)
+            for (int x = 1; x <= W; x++)
             {
-                ARRC(x, z) = RAWC(x - 1, z - 1) + ARRC(x - 1, z) + ARRC(x, z - 1) - ARRC(x - 1, z - 1);
+                ARRR(x, z) = RAWR(x - 1, z - 1) + ARRR(x - 1, z) + ARRR(x, z - 1) - ARRR(x - 1, z - 1);
             }
         }
     }
@@ -484,41 +560,18 @@ std::vector<Res> findBiggestRiver(
     const auto &ring = getRingMask<scale>();
     uint64_t ringCalls = 0;
 
-    auto ringSum = [&](const std::vector<int> &pref, int cx, int cz) -> int {
-        /* Hot path: annular sum via 2D prefix; keep branch light and locals in registers. */
-        int area = 0;
-        const int *prefData = pref.data();
-        for (const auto &m: ring.rows)
+    /* Shell cross-sections, one per sampled layer: dy = layerY - afkY and each
+     * row uses the exact discrete sphere intersection (see makeShellMask). */
+    std::vector<RingMask> shellMasks;
+    if constexpr (scale == 1)
+    {
+        shellMasks.resize((size_t) layers);
+        for (int layer = 0; layer < layers; layer++)
         {
-            const int row = cz + m.dz;
-            const int row1 = row + 1;
-            const size_t base1 = (size_t) row1 * (size_t) stride;
-            const size_t base0 = (size_t) row * (size_t) stride;
-            const int L = cx - m.out;
-            const int R = cx + m.out;
-            if (m.in < 0)
-            {
-                area += prefData[base1 + (size_t) (R + 1)]
-                      - prefData[base1 + (size_t) L]
-                      - prefData[base0 + (size_t) (R + 1)]
-                      + prefData[base0 + (size_t) L];
-            }
-            else
-            {
-                const int Lin = cx - m.in;
-                const int Rin = cx + m.in;
-                area += prefData[base1 + (size_t) Lin]
-                      - prefData[base1 + (size_t) L]
-                      - prefData[base0 + (size_t) Lin]
-                      + prefData[base0 + (size_t) L];
-                area += prefData[base1 + (size_t) (R + 1)]
-                      - prefData[base1 + (size_t) (Rin + 1)]
-                      - prefData[base0 + (size_t) (R + 1)]
-                      + prefData[base0 + (size_t) (Rin + 1)];
-            }
+            const int dy = yRange.yMin + layer - afkY;
+            shellMasks[(size_t) layer] = makeShellMask(dy);
         }
-        return area;
-    };
+    }
 
     CandidateArea maxA{0, 0, 0, 0, 0};
 
@@ -604,18 +657,28 @@ std::vector<Res> findBiggestRiver(
 
             if constexpr (scale == 1)
             {
-                /* B1 volume integral (same model as C, different unit):
-                 * sumC/sumR are 0..49640*L; the reported score is the
-                 * per-layer average, so total stays 0..49640 and every
-                 * minArea / f prune / sort keeps its old meaning. */
-                const int sumR = ringSum(prefixRiver, cx, cz);
-                const int sumC = ringSum(prefixCave, cx, cz);
+                /* Shell model: each layer contributes only the part of the
+                 * 24..128 sphere that lies at that Y (dy = layerY - afkY).
+                 * Every cell in the shell counts; there is no chunk-level
+                 * culling.  Summing the layer cross-sections and dividing by
+                 * L keeps the 0..49659 per-layer-average scale. */
+                int sumR = 0;
+                int sumC = 0;
+                for (int layer = 0; layer < layers; layer++)
+                {
+                    const RingMask &mask = shellMasks[(size_t) layer];
+                    if (mask.rows.empty())
+                        continue;
+                    const size_t base = (size_t) layer * perLayer;
+                    sumR += ringSumPref(prefixRiver.data() + base, stride, mask, cx, cz);
+                    sumC += ringSumPref(prefixCave.data() + base, stride, mask, cx, cz);
+                }
                 worldRiver = worldCave = 0;
-                worldTotal = lowyd::aggregateLayerAverages(sumC, sumR, riverWeight, yRange.count(),
-                                                    &worldCave, &worldRiver);
+                worldTotal = lowyd::aggregateLayerAverages(sumC, sumR, riverWeight, layers,
+                                                           &worldCave, &worldRiver);
             } else
             {
-                const int sum = ringSum(prefixRiver, cx, cz);
+                const int sum = ringSumPref(prefixRiver.data(), stride, ring, cx, cz);
                 worldTotal = sum * scale * scale;
                 worldCave = 0;
                 worldRiver = 0;
@@ -659,9 +722,7 @@ std::vector<Res> findBiggestRiver(
     }
 
 #undef RAWR
-#undef RAWC
 #undef ARRR
-#undef ARRC
 
     if (lowyd_bench::enabled())
     {
@@ -671,6 +732,176 @@ std::vector<Res> findBiggestRiver(
             lowyd_bench::add(c.coarseCells, (uint64_t) W * (uint64_t) H);
     }
     return result;
+}
+
+/**
+ * Score an already-filled point window.  The prefix arrays have W+1 columns
+ * and W+1 rows per layer, and the point sits at (W/2, W/2).
+ */
+static lowyd::PointScore scorePrefilled(const std::vector<int> &prefixRiver,
+                                 const std::vector<int> &prefixCave,
+                                 int W,
+                                 const lowyd::SearchParams &params, int coverage)
+{
+    const int layers = params.yMax - params.yMin + 1;
+    const int stride = W + 1;
+    const size_t perLayer = (size_t) stride * (size_t) (W + 1);
+    const int cx = W / 2;
+    const int cz = W / 2;
+
+    int sumR = 0;
+    int sumC = 0;
+    if (coverage == lowyd::POINT_COVERAGE_CYLINDER)
+    {
+        const RingMask &ring = getRingMask<1>();
+        for (int layer = 0; layer < layers; layer++)
+        {
+            const size_t base = (size_t) layer * perLayer;
+            sumR += ringSumPref(prefixRiver.data() + base, stride, ring, cx, cz);
+            sumC += ringSumPref(prefixCave.data() + base, stride, ring, cx, cz);
+        }
+    }
+    else
+    {
+        for (int layer = 0; layer < layers; layer++)
+        {
+            const RingMask mask = makeShellMask(params.yMin + layer - params.afkY);
+            if (mask.rows.empty())
+                continue;
+            const size_t base = (size_t) layer * perLayer;
+            sumR += ringSumPref(prefixRiver.data() + base, stride, mask, cx, cz);
+            sumC += ringSumPref(prefixCave.data() + base, stride, mask, cx, cz);
+        }
+    }
+
+    lowyd::PointScore score;
+    score.total = lowyd::aggregateLayerAverages(sumC, sumR, params.riverWeight, layers,
+                                         &score.cave, &score.river);
+    return score;
+}
+
+lowyd::PointScore scorePoint(Generator *g, int x, int z, const lowyd::SearchParams &params,
+                      int coverage)
+{
+    const int W = 2 * lowyd::RING_OUTER + 1;
+    const int startX = x - lowyd::RING_OUTER;
+    const int startZ = z - lowyd::RING_OUTER;
+    std::vector<int> prefixRiver;
+    std::vector<int> prefixCave;
+    std::vector<uint8_t> hitMask;
+    fillPreciseShellWindow(g, startX, startZ, W, W,
+                           lowyd::PreciseYRange{params.yMin, params.yMax},
+                           prefixRiver, prefixCave, hitMask);
+    return scorePrefilled(prefixRiver, prefixCave, W, params, coverage);
+}
+
+std::vector<lowyd::PointScoreAtY> sweepPointAfkY(Generator *g, int x, int z,
+                                          const lowyd::SearchParams &params,
+                                          int coverage,
+                                          int afkYFrom, int afkYTo)
+{
+    std::vector<lowyd::PointScoreAtY> result;
+    afkYFrom = std::max(afkYFrom, lowyd::AFK_Y_LIMIT_MIN);
+    afkYTo = std::min(afkYTo, lowyd::AFK_Y_LIMIT_MAX);
+    if (afkYFrom > afkYTo)
+        return result;
+    result.reserve((size_t) (afkYTo - afkYFrom + 1));
+
+    const int W = 2 * lowyd::RING_OUTER + 1;
+    const int startX = x - lowyd::RING_OUTER;
+    const int startZ = z - lowyd::RING_OUTER;
+    std::vector<int> prefixRiver;
+    std::vector<int> prefixCave;
+    std::vector<uint8_t> hitMask;
+    fillPreciseShellWindow(g, startX, startZ, W, W,
+                           lowyd::PreciseYRange{params.yMin, params.yMax},
+                           prefixRiver, prefixCave, hitMask);
+
+    for (int afkY = afkYFrom; afkY <= afkYTo; afkY++)
+    {
+        lowyd::SearchParams at = params;
+        at.afkY = afkY;
+        result.push_back({afkY,
+                          scorePrefilled(prefixRiver, prefixCave, W, at, coverage)});
+    }
+    return result;
+}
+
+lowyd::PointCentroids pointCaveCentroids(Generator *g, int x, int z,
+                                         const lowyd::SearchParams &params)
+{
+    lowyd::PointCentroids out;
+    const int W = 2 * lowyd::RING_OUTER + 1;
+    const int startX = x - lowyd::RING_OUTER;
+    const int startZ = z - lowyd::RING_OUTER;
+    const int stride = W + 1;
+    const size_t perLayer = (size_t) stride * (size_t) (W + 1);
+    const int layers = params.yMax - params.yMin + 1;
+    const int cx = W / 2;
+    const int cz = W / 2;
+
+    std::vector<int> prefixRiver;
+    std::vector<int> prefixCave;
+    std::vector<uint8_t> hitMask;
+    fillPreciseShellWindow(g, startX, startZ, W, W,
+                           lowyd::PreciseYRange{params.yMin, params.yMax},
+                           prefixRiver, prefixCave, hitMask);
+
+    double visualX = 0.0, visualZ = 0.0, scoredX = 0.0, scoredZ = 0.0;
+    int visualCells = 0, scoredCells = 0;
+
+    for (int layer = 0; layer < layers; layer++)
+    {
+        const int dy = params.yMin + layer - params.afkY;
+        const int *cavePlane = prefixCave.data() + (size_t) layer * perLayer;
+        for (int dz = -lowyd::RING_OUTER; dz <= lowyd::RING_OUTER; dz++)
+        {
+            const int outerDisk = (int) std::floor(
+                std::sqrt((double) ((long long) lowyd::RING_OUTER * lowyd::RING_OUTER
+                                    - (long long) dz * dz)));
+            int outerShell = -1;
+            int innerShell = -1;
+            if (!lowyd::shellRowRadii(dy, dz, outerShell, innerShell))
+                outerShell = -1;
+
+            for (int dx = -outerDisk; dx <= outerDisk; dx++)
+            {
+                const int cellCave = rangeSumPref(cavePlane, stride, W, cz + dz,
+                                                  cx + dx, cx + dx);
+                if (cellCave <= 0)
+                    continue;
+                const int worldX = x + dx;
+                const int worldZ = z + dz;
+                visualX += worldX;
+                visualZ += worldZ;
+                visualCells++;
+
+                if (outerShell < 0)
+                    continue;
+                if (std::abs(dx) > outerShell)
+                    continue;
+                if (innerShell >= 0 && std::abs(dx) <= innerShell)
+                    continue;
+                scoredX += worldX;
+                scoredZ += worldZ;
+                scoredCells++;
+            }
+        }
+    }
+
+    if (visualCells > 0)
+    {
+        out.visual.x = visualX / visualCells;
+        out.visual.z = visualZ / visualCells;
+        out.visual.cells = visualCells;
+    }
+    if (scoredCells > 0)
+    {
+        out.scored.x = scoredX / scoredCells;
+        out.scored.z = scoredZ / scoredCells;
+        out.scored.cells = scoredCells;
+    }
+    return out;
 }
 
 /** Flat (dz, out, in) triples of getRingMask<scale>(), for the device. */
@@ -1228,7 +1459,7 @@ void findBiggestRiverParallelPool(
 #include <string>
 
 static constexpr double kBenchDblF = 337.0 / 331.0;
-static constexpr double kRingFullArea = 49640.0;
+static constexpr double kRingFullArea = 49659.0;
 
 static double benchOctA(const DoublePerlinNoise *dpn, int idx, double x, double z, int *perlins)
 {

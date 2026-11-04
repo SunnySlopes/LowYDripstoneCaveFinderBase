@@ -553,7 +553,7 @@ static std::vector<PitPeak> filterContinentalness(const DoublePerlinNoise *cont,
 
 static std::vector<Res> scoreBiomes(Generator *g, const std::vector<PitPeak> &peaks, int minArea,
                                     float riverWeight, int threads, Progress *progress,
-                                    const lowyd::PreciseYRange &yRange)
+                                    const lowyd::PreciseYRange &yRange, int afkY)
 {
     beginPhase(progress, 3, (int) peaks.size());
     if (peaks.empty())
@@ -566,7 +566,7 @@ static std::vector<Res> scoreBiomes(Generator *g, const std::vector<PitPeak> &pe
         ThreadPool pool((size_t) std::max(1, threads));
         for (const PitPeak &peak : peaks)
         {
-            pool.enqueue([&, peak, seedVal, mcVer, minArea, riverWeight]() {
+            pool.enqueue([&, peak, seedVal, mcVer, minArea, riverWeight, afkY]() {
                 if (pitPausedOrStopped(progress))
                     return;
                 if (progress)
@@ -600,7 +600,7 @@ static std::vector<Res> scoreBiomes(Generator *g, const std::vector<PitPeak> &pe
                     auto precise = findBiggestRiver<1>(
                         &tlsG, originX, originZ, kAreaWindow, kAreaWindow,
                         minArea, 1.0, FilterMode::PreciseBiome, riverWeight,
-                        nullptr, 0, nullptr, yRange);
+                        nullptr, 0, nullptr, yRange, afkY);
                     const Res preciseBest = bestOf(std::move(precise));
                     if (preciseBest.area >= minArea)
                         found.addResult(preciseBest);
@@ -639,7 +639,7 @@ static std::vector<Res> clipResultsToBox(std::vector<Res> found, int minX, int m
 
 std::vector<Res> runLargePitSearch(Generator *g, int minArea, float riverWeight, int threads, Progress *progress,
                                    int minX, int maxX, int minZ, int maxZ,
-                                   const lowyd::PreciseYRange &yRange)
+                                   const lowyd::PreciseYRange &yRange, int afkY)
 {
     if (threads < 1)
         threads = 1;
@@ -664,6 +664,6 @@ std::vector<Res> runLargePitSearch(Generator *g, int minArea, float riverWeight,
     if (progress && progress->try_stop.load())
         return {};
     (void) riverWeight;
-    return clipResultsToBox(scoreBiomes(g, passed, minArea, 0.0f, threads, progress, yRange),
+    return clipResultsToBox(scoreBiomes(g, passed, minArea, 0.0f, threads, progress, yRange, afkY),
                             minX, maxX, minZ, maxZ);
 }

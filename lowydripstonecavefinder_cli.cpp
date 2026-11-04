@@ -89,6 +89,7 @@ struct Options {
     double riverWeight = 0.75;
     int yMin = lowyd::Y_DEFAULT_MIN;
     int yMax = lowyd::Y_DEFAULT_MAX;
+    int afkY = lowyd::AFK_Y_DEFAULT;
     int coarseY = lowyd::COARSE_Y_DEFAULT;
     int threads = 0;
     int mode = lowyd::SEARCH_MODE_FAST;
@@ -102,6 +103,17 @@ struct Options {
     bool bench = false;
     /** >0: run the GPU-vs-CPU coarse-grid verification over chunks of this side. */
     int gpuVerify = 0;
+
+    /** --score-point <x> <z>: score one exact point instead of searching. */
+    bool scorePointMode = false;
+    int scoreX = 0;
+    int scoreZ = 0;
+    int pointCoverage = lowyd::POINT_COVERAGE_SHELL;
+    int pointRepeat = 5;
+    bool sweepAfkY = false;
+    int sweepFrom = lowyd::AFK_Y_LIMIT_MIN;
+    int sweepTo = lowyd::AFK_Y_LIMIT_MAX;
+    bool centroid = false;
 
     bool help = false;
     bool version = false;
@@ -150,18 +162,32 @@ void printUsage(std::ostream &os)
         "                          pit     = full-map large-pit chains\n"
         "  --mc <id|version>       generation base, default 26.3\n"
         "  --min-area <int>        minimum weighted total area; defaults to 70% of\n"
-        "                          49640 (34748) for fast/precise and 90% (44676) for pit\n"
+        "                          49659 (34761) for fast/precise and 90% (44693) for pit\n"
         "  --river-weight <float>  river area weight in total = cave + river * weight,\n"
         "                          default 0.75, range [0, 1]\n"
         "  --y-min <int>           lowest sampled layer, default -63 (floor -63)\n"
         "  --y-max <int>           highest sampled layer, default -51 (ceiling 319)\n"
         "                          y-max - y-min + 1 must be <= 48 (hard limit);\n"
-        "                          the score is the per-layer average volume\n"
-        "  --coarse-y <int>        coarse-stage recall height, default -51.  The\n"
-        "                          climate prefilter is Y-independent in this\n"
+        "                          the score is the per-layer average of the shell\n"
+        "  --afk-y <int>           AFK / player Y of the shell model, default -40\n"
+        "                          (range -64..320); the scored region is the 3D\n"
+        "                          shell 24 < distance <= 128 around (x, afk-y, z)\n"
+        "  --coarse-y <int>        coarse-stage recall height, default -51.  The\n"        "                          climate prefilter is Y-independent in this\n"
         "                          engine, so the value is carried for protocol\n"
         "                          compatibility only\n"
         "  --threads <int>         worker threads, default min(CPU count, 256)\n"
+        "\n"
+        "Point scoring (diagnostic; replaces the search):\n"
+        "  --score-point <x> <z>   score exactly one point with the same 1:1 layer\n"
+        "                          sampling and print total / cave / river + timing\n"
+        "  --model <name>          shell (current: 24..128 shell, no chunk culling),\n"
+        "                          cylinder (pre-shell full horizontal annulus);\n"
+        "                          default shell\n"
+        "  --repeat <int>          timed repetitions of the point score, default 5\n"
+        "  --sweep-afk-y <a> <b>   score the point for every AFK Y in [a,b] using\n"
+        "                          one biome sampling pass; prints the best Y\n"
+        "  --centroid              print the visual and scored cave-cell centroids\n"
+        "                          (shows how far the cave blob is from the point)\n"
         "\n"
         "Output:\n"
         "  --limit <int>           maximum result rows, default 0 = all\n"
@@ -205,6 +231,10 @@ void printUsage(std::ostream &os)
         "  lowydripstonecavefinder-cli --seed 12345 --mode pit --mc 26.3 \\\n"
         "      --min-x -30000000 --max-x 30000000 --min-z -30000000 --max-z 30000000 \\\n"
         "      --out pit.txt\n"
+        "  lowydripstonecavefinder-cli --seed -5474371961803057987 \\\n"
+        "      --score-point -29694592 -17115233 --model shell --repeat 5\n"
+        "  lowydripstonecavefinder-cli --seed -5474371961803057987 \\\n"
+        "      --score-point -29694592 -17115233 --sweep-afk-y -64 0\n"
         "  lowydripstonecavefinder-cli --weirdness-y-offset 12345\n";
 }
 
@@ -282,6 +312,21 @@ bool parseMode(std::string_view text, int &mode)
     if (text == "pit" || text == "large-pit" || text == "full-map-pit")
     {
         mode = lowyd::SEARCH_MODE_FULL_MAP_PIT;
+        return true;
+    }
+    return false;
+}
+
+bool parsePointModel(std::string_view text, int &coverage)
+{
+    if (text == "shell")
+    {
+        coverage = lowyd::POINT_COVERAGE_SHELL;
+        return true;
+    }
+    if (text == "cylinder")
+    {
+        coverage = lowyd::POINT_COVERAGE_CYLINDER;
         return true;
     }
     return false;
@@ -432,11 +477,55 @@ Options parseOptions(int argc, char **argv)
             if (!parseInt(value, options.yMax))
                 usageError("invalid --y-max: " + std::string(value));
         }
+        else if (arg == "--afk-y")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parseInt(value, options.afkY))
+                usageError("invalid --afk-y: " + std::string(value));
+        }
         else if (arg == "--coarse-y")
         {
             const std::string_view value = requireValue(argc, argv, i, arg);
             if (!parseInt(value, options.coarseY))
                 usageError("invalid --coarse-y: " + std::string(value));
+        }
+        else if (arg == "--score-point")
+        {
+            if (i + 2 >= argc)
+                usageError("--score-point requires <x> <z>");
+            const std::string_view sx = argv[++i];
+            const std::string_view sz = argv[++i];
+            if (!parseInt(sx, options.scoreX) || !parseInt(sz, options.scoreZ))
+                usageError("invalid --score-point coordinates: " + std::string(sx) + " "
+                           + std::string(sz));
+            options.scorePointMode = true;
+        }
+        else if (arg == "--model")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parsePointModel(value, options.pointCoverage))
+                usageError("invalid --model: " + std::string(value));
+        }
+        else if (arg == "--repeat")
+        {
+            const std::string_view value = requireValue(argc, argv, i, arg);
+            if (!parseInt(value, options.pointRepeat))
+                usageError("invalid --repeat: " + std::string(value));
+        }
+        else if (arg == "--sweep-afk-y")
+        {
+            if (i + 2 >= argc)
+                usageError("--sweep-afk-y requires <from> <to>");
+            const std::string_view from = argv[++i];
+            const std::string_view to = argv[++i];
+            if (!parseInt(from, options.sweepFrom) || !parseInt(to, options.sweepTo))
+                usageError("invalid --sweep-afk-y range: " + std::string(from) + " "
+                           + std::string(to));
+            options.sweepAfkY = true;
+        }
+        else if (arg == "--centroid")
+        {
+            options.centroid = true;
         }
         else if (arg == "--threads")
         {
@@ -497,6 +586,30 @@ void validateOptions(Options &options)
     if (!options.seedSet)
         usageError("--seed is required");
 
+    if (options.scorePointMode)
+    {
+        if (options.gpuVerify > 0)
+            usageError("--score-point cannot be combined with --gpu-verify");
+        if (std::abs(options.scoreX) > kWorldLimit || std::abs(options.scoreZ) > kWorldLimit)
+            usageError("point coordinates must be within the world border (-30000000..30000000)");
+        if (options.pointRepeat < 1 || options.pointRepeat > 100)
+            usageError("--repeat must be between 1 and 100");
+        if (options.sweepAfkY)
+        {
+            if (options.sweepFrom < lowyd::AFK_Y_LIMIT_MIN
+                || options.sweepTo > lowyd::AFK_Y_LIMIT_MAX)
+                usageError("--sweep-afk-y must stay within ["
+                           + std::to_string(lowyd::AFK_Y_LIMIT_MIN) + ", "
+                           + std::to_string(lowyd::AFK_Y_LIMIT_MAX) + "]");
+            if (options.sweepFrom > options.sweepTo)
+                usageError("--sweep-afk-y <from> must be <= <to>");
+        }
+    }
+    else if (options.sweepAfkY)
+    {
+        usageError("--sweep-afk-y requires --score-point");
+    }
+
     if (options.square > 0 && options.boundsSet)
         usageError("--square cannot be combined with explicit --min-x/--max-x/--min-z/--max-z");
 
@@ -528,6 +641,9 @@ void validateOptions(Options &options)
         usageError("layer span must not exceed " + std::to_string(lowyd::Y_MAX_SPAN)
                    + " layers (current " + std::to_string(options.yMax - options.yMin + 1)
                    + "); the window cache and the shell model both stop holding");
+    if (options.afkY < lowyd::AFK_Y_LIMIT_MIN || options.afkY > lowyd::AFK_Y_LIMIT_MAX)
+        usageError("--afk-y must stay within [" + std::to_string(lowyd::AFK_Y_LIMIT_MIN) + ", "
+                   + std::to_string(lowyd::AFK_Y_LIMIT_MAX) + "]");
     if (options.coarseY < lowyd::Y_LIMIT_MIN || options.coarseY > lowyd::Y_LIMIT_MAX)
         usageError("--coarse-y must stay within [" + std::to_string(lowyd::Y_LIMIT_MIN) + ", "
                    + std::to_string(lowyd::Y_LIMIT_MAX) + "]");
@@ -656,9 +772,10 @@ std::string formatSearchReport(const Options &options, int startX, int startZ,
 {
     std::ostringstream out;
     out << "# LowYDripstoneCaveFinder CLI " << kCliVersion << "\n";
-    out << "# model=" << lowyd::modelId(options.yMin, options.yMax)
+    out << "# model=" << lowyd::modelId(options.yMin, options.yMax, options.afkY)
         << " y=[" << options.yMin << "," << options.yMax << "]"
         << " L=" << (options.yMax - options.yMin + 1)
+        << " afkY=" << options.afkY
         << " coarseY=" << options.coarseY << "\n";
     out << "# engine=LowYDripstoneCaveFinderBase " << kEngineVersion
         << " seed=" << options.seed
@@ -683,13 +800,13 @@ std::string formatSearchReport(const Options &options, int startX, int startZ,
         const double ratioPercent = hit.total / kFullRingArea * 100.0;
         if (options.mode == lowyd::SEARCH_MODE_FULL_MAP_PIT)
         {
-            out << "/tp " << hit.x << " 64 " << hit.z
+            out << "/tp " << hit.x << " " << options.afkY << " " << hit.z
                 << " s=" << hit.total << "/" << fullAreaInt
                 << " = " << ratioPercent << "%\n";
         }
         else
         {
-            out << "/tp " << hit.x << " 64 " << hit.z
+            out << "/tp " << hit.x << " " << options.afkY << " " << hit.z
                 << " s=" << hit.total << "/" << fullAreaInt
                 << " = " << ratioPercent << "%"
                 << " cave=" << hit.cave
@@ -1058,6 +1175,126 @@ int runGpuVerify(const Options &options)
 
 } // namespace
 
+const char *pointCoverageName(int coverage)
+{
+    switch (coverage)
+    {
+        case lowyd::POINT_COVERAGE_SHELL:
+            return "shell";
+        case lowyd::POINT_COVERAGE_CYLINDER:
+            return "cylinder";
+        default:
+            return "shell";
+    }
+}
+
+int runPointScore(const Options &options)
+{
+    lowyd::SearchParams params;
+    params.seed = static_cast<uint64_t>(options.seed);
+    params.yMin = options.yMin;
+    params.yMax = options.yMax;
+    params.afkY = options.afkY;
+    params.riverWeight = static_cast<float>(options.riverWeight);
+    params.mc = options.mc;
+    std::string error;
+    if (!lowyd::validate(params, &error))
+    {
+        std::cerr << "error: " << error << "\n";
+        return 1;
+    }
+
+    Generator g;
+    setupGenerator(&g, options.mc, FORCE_OCEAN_VARIANTS);
+    applySeed(&g, DIM_OVERWORLD, static_cast<uint64_t>(options.seed));
+
+    const int layers = params.yMax - params.yMin + 1;
+    std::cout << "# point model=" << pointCoverageName(options.pointCoverage)
+              << " x=" << options.scoreX << " z=" << options.scoreZ
+              << " y=[" << params.yMin << "," << params.yMax << "] L=" << layers
+              << " afkY=" << params.afkY
+              << " repeat=" << options.pointRepeat << "\n";
+    std::cout << "# platform on="
+              << (lowyd::onShellPlatform(params.yMin, params.yMax, params.afkY) ? 1 : 0)
+              << " platformY="
+              << lowyd::shellPlatformPlayerY(params.yMin, params.yMax) << "\n";
+
+    /* One warm-up call (loads the biome cache path / OpenCL-independent code). */
+    (void) lowyd::scorePoint(&g, options.scoreX, options.scoreZ, params,
+                             options.pointCoverage);
+
+    lowyd::PointScore last;
+    double minMs = std::numeric_limits<double>::max();
+    double sumMs = 0.0;
+    for (int i = 0; i < options.pointRepeat; i++)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        last = lowyd::scorePoint(&g, options.scoreX, options.scoreZ, params,
+                                 options.pointCoverage);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        minMs = std::min(minMs, ms);
+        sumMs += ms;
+    }
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "point total=" << last.total
+              << " cave=" << last.cave
+              << " river=" << last.river
+              << " pct=" << (100.0 * last.total / lowyd::RIVER_AREA_FULL)
+              << " min_ms=" << minMs
+              << " avg_ms=" << (sumMs / options.pointRepeat) << "\n";
+
+    if (options.sweepAfkY)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto rows = lowyd::sweepPointAfkY(
+            &g, options.scoreX, options.scoreZ, params, options.pointCoverage,
+            options.sweepFrom, options.sweepTo);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double sweepMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        int bestTotal = -1;
+        int bestY = options.sweepFrom;
+        int atMinus40 = -1;
+        for (const auto &row : rows)
+        {
+            std::cout << "y " << row.afkY << " " << row.score.total << " "
+                      << row.score.cave << " " << row.score.river << "\n";
+            if (row.score.total > bestTotal)
+            {
+                bestTotal = row.score.total;
+                bestY = row.afkY;
+            }
+            if (row.afkY == -40)
+                atMinus40 = row.score.total;
+        }
+        std::cout << "# sweep " << options.sweepFrom << ".." << options.sweepTo
+                  << " values=" << rows.size()
+                  << " total_ms=" << sweepMs
+                  << " best=" << bestTotal << " bestY=" << bestY
+                  << " at_-40=" << atMinus40 << "\n";
+    }
+
+    if (options.centroid)
+    {
+        const auto centroids = lowyd::pointCaveCentroids(
+            &g, options.scoreX, options.scoreZ, params);
+        auto printCentroid = [&](const char *label, const lowyd::PointCentroid &c) {
+            const double dx = c.x - options.scoreX;
+            const double dz = c.z - options.scoreZ;
+            std::cout << "# centroid " << label
+                      << " x=" << c.x << " z=" << c.z
+                      << " cells=" << c.cells
+                      << " dx=" << dx << " dz=" << dz
+                      << " dist=" << std::sqrt(dx * dx + dz * dz) << "\n";
+        };
+        printCentroid("visual", centroids.visual);
+        printCentroid("scored", centroids.scored);
+    }
+    return 0;
+}
+
 int run(int argc, char **argv)
 {
     /* Backend default from the environment; --backend overrides it. */
@@ -1096,6 +1333,9 @@ int run(int argc, char **argv)
 
     validateOptions(options);
 
+    if (options.scorePointMode)
+        return runPointScore(options);
+
     if (options.gpuVerify > 0)
         return runGpuVerify(options);
 
@@ -1110,6 +1350,7 @@ int run(int argc, char **argv)
     params.riverWeight = static_cast<float>(options.riverWeight);
     params.yMin = options.yMin;
     params.yMax = options.yMax;
+    params.afkY = options.afkY;
     params.coarseY = options.coarseY;
     params.numThreads = options.threads;
     params.mc = options.mc;
@@ -1134,6 +1375,7 @@ int run(int argc, char **argv)
               << " minArea=" << options.minArea
               << " riverWeight=" << options.riverWeight
               << " y=[" << options.yMin << "," << options.yMax << "]"
+              << " afkY=" << options.afkY
               << " threads=" << options.threads << "\n";
 
     const auto started = std::chrono::steady_clock::now();

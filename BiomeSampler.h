@@ -16,12 +16,12 @@ static constexpr double CONT_PARTIAL_FINAL_THRESHOLD = 0.55;
 /**
  * Reusable buffers of the precise pass (B2).
  *
- * findBiggestRiver<1>() and fillPreciseWindow() used to allocate ~7 vectors and
- * one biome cache per candidate.  The vectors keep their capacity across calls
- * (thousands of candidates reuse the same memory) and only the biome cache is
- * sized through getMinCacheSize().  genBiomeNoiseScaled() writes every cell of
- * the requested range, including its internal Voronoi source block, so a reused
- * buffer never needs zeroing.
+ * findBiggestRiver<1>() and fillPreciseShellWindow() used to allocate ~7 vectors
+ * and one biome cache per candidate.  The vectors keep their capacity across
+ * calls (thousands of candidates reuse the same memory) and only the biome
+ * cache is sized through getMinCacheSize().  genBiomeNoiseScaled() writes every
+ * cell of the requested range, including its internal Voronoi source block, so
+ * a reused buffer never needs zeroing.
  *
  * One instance exists per worker thread of the current search; the engine owns
  * it (see preciseScratch()), so no buffer is freed from a worker's exit path.
@@ -36,6 +36,8 @@ struct PreciseScratch {
     std::vector<uint8_t> climatePass;
     std::vector<uint8_t> occ;
     std::vector<uint8_t> centerCand;
+    /** Any cave/river hit in this column (used for the refine-window occupancy tiles). */
+    std::vector<uint8_t> hitMask;
     std::vector<int32_t> diff;
     /** (bx,bz) -> climate gate result; cleared, never reallocated. */
     std::unordered_map<uint64_t, uint8_t> climCache;
@@ -86,13 +88,22 @@ void samplePreciseCell(const Generator *g, int worldX, int worldZ,
                        const lowyd::PreciseYRange &yRange, int *riverHits, int *caveHits);
 
 /**
- * Fill W×H precise river/cave hit-count grids for a refine window.
- * Uses (bx,bz) climate-gate cache and one scale-1 volume genBiomes over
- * yRange.yMin..yRange.yMax.  rawRiver/rawCave hold 0..L hits per column; the
- * caller divides by L (volume integral, see lowyd::aggregateLayerAverages).
+ * Build per-layer 2D prefix sums of the precise cave/river hits for a refine
+ * window (one prefix plane per sampled layer).
+ *
+ * The shell model needs each layer's annulus separately: with the AFK point at
+ * (x, afkY, z), layer y contributes only the cells whose horizontal distance
+ * satisfies shellRingRadii().  One scale-1 volume genBiomes over
+ * yRange.yMin..yRange.yMax fills every layer; the climate gate is still shared
+ * by all layers of a column.
+ *
+ * prefixRiver / prefixCave hold `layers * (W+1) * (H+1)` ints (layer-major,
+ * stride W+1).  hitMask marks columns with at least one hit in any layer.
  */
-void fillPreciseWindow(Generator *g, int startX, int startZ, int W, int H,
-                       const lowyd::PreciseYRange &yRange,
-                       std::vector<int> &rawRiver, std::vector<int> &rawCave);
+void fillPreciseShellWindow(Generator *g, int startX, int startZ, int W, int H,
+                            const lowyd::PreciseYRange &yRange,
+                            std::vector<int> &prefixRiver,
+                            std::vector<int> &prefixCave,
+                            std::vector<uint8_t> &hitMask);
 
 #endif
