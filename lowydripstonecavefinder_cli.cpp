@@ -59,7 +59,6 @@ constexpr const char *kCliVersion = "1.1.0";
 constexpr const char *kEngineVersion = "1.1.0";
 
 constexpr int kRingOuter = lowyd::RING_OUTER;
-constexpr double kFullRingArea = lowyd::RIVER_AREA_FULL;
 constexpr int kOutputCell = lowyd::OUTPUT_REGION_SIZE;
 
 constexpr int kDefaultMinX = -65536;
@@ -86,10 +85,11 @@ struct Options {
 
     int minArea = 0;
     bool minAreaSet = false;
-    double riverWeight = 0.75;
+    double riverWeight = 0.7;
     int yMin = lowyd::Y_DEFAULT_MIN;
     int yMax = lowyd::Y_DEFAULT_MAX;
-    int afkY = lowyd::AFK_Y_DEFAULT;
+    /** AFK_Y_AUTO means "yMin + 23"; resolved in validateOptions(). */
+    int afkY = lowyd::AFK_Y_AUTO;
     int coarseY = lowyd::COARSE_Y_DEFAULT;
     int threads = 0;
     int mode = lowyd::SEARCH_MODE_FAST;
@@ -118,6 +118,15 @@ struct Options {
     bool help = false;
     bool version = false;
 };
+
+/**
+ * Exact display denominator of the configured model (see lowyd::fullShellArea).
+ * Recomputed per run because it depends on the layer range and the AFK Y.
+ */
+inline int fullAreaFor(const Options &options)
+{
+    return lowyd::fullShellArea(options.yMin, options.yMax, options.afkY);
+}
 
 std::string_view modeName(int mode)
 {
@@ -162,16 +171,20 @@ void printUsage(std::ostream &os)
         "                          pit     = full-map large-pit chains\n"
         "  --mc <id|version>       generation base, default 26.3\n"
         "  --min-area <int>        minimum weighted total area; defaults to 70% of\n"
-        "                          49659 (34761) for fast/precise and 90% (44693) for pit\n"
+        "                          the exact shell denominator (34761 for the\n"
+        "                          default -63..-51 / afkY=-40 window) and 90%\n"
+        "                          (44693) for pit.  The denominator is computed\n"
+        "                          from the layer range and AFK Y, not fitted.\n"
         "  --river-weight <float>  river area weight in total = cave + river * weight,\n"
-        "                          default 0.75, range [0, 1]\n"
+        "                          default 0.7, range [0, 1]\n"
         "  --y-min <int>           lowest sampled layer, default -63 (floor -63)\n"
         "  --y-max <int>           highest sampled layer, default -51 (ceiling 319)\n"
         "                          y-max - y-min + 1 must be <= 48 (hard limit);\n"
         "                          the score is the per-layer average of the shell\n"
-        "  --afk-y <int>           AFK / player Y of the shell model, default -40\n"
-        "                          (range -64..320); the scored region is the 3D\n"
-        "                          shell 24 < distance <= 128 around (x, afk-y, z)\n"
+        "  --afk-y <int>           AFK / player Y of the shell model; default is\n"
+        "                          y-min + 23 (=-40 for the default window), range\n"
+        "                          -64..320.  The scored region is the 3D shell\n"
+        "                          24 < distance <= 128 around (x, afk-y, z)\n"
         "  --coarse-y <int>        coarse-stage recall height, default -51.  The\n"        "                          climate prefilter is Y-independent in this\n"
         "                          engine, so the value is carried for protocol\n"
         "                          compatibility only\n"
@@ -641,6 +654,8 @@ void validateOptions(Options &options)
         usageError("layer span must not exceed " + std::to_string(lowyd::Y_MAX_SPAN)
                    + " layers (current " + std::to_string(options.yMax - options.yMin + 1)
                    + "); the window cache and the shell model both stop holding");
+    /* Default AFK Y tracks the lowest layer (+23) instead of a hard-coded -40. */
+    options.afkY = lowyd::resolveAfkY(options.yMin, options.afkY);
     if (options.afkY < lowyd::AFK_Y_LIMIT_MIN || options.afkY > lowyd::AFK_Y_LIMIT_MAX)
         usageError("--afk-y must stay within [" + std::to_string(lowyd::AFK_Y_LIMIT_MIN) + ", "
                    + std::to_string(lowyd::AFK_Y_LIMIT_MAX) + "]");
@@ -664,7 +679,7 @@ void validateOptions(Options &options)
     if (!options.minAreaSet)
     {
         const double ratio = options.mode == lowyd::SEARCH_MODE_FULL_MAP_PIT ? 0.90 : 0.70;
-        options.minArea = static_cast<int>(kFullRingArea * ratio);
+        options.minArea = static_cast<int>(fullAreaFor(options) * ratio);
     }
 
     if (options.threads <= 0)
@@ -793,11 +808,11 @@ std::string formatSearchReport(const Options &options, int startX, int startZ,
         out << " shown=" << hits.size();
     out << "\n";
 
-    const int fullAreaInt = static_cast<int>(kFullRingArea);
+    const int fullAreaInt = fullAreaFor(options);
     out << std::fixed << std::setprecision(2);
     for (const lowyd::Hit &hit: hits)
     {
-        const double ratioPercent = hit.total / kFullRingArea * 100.0;
+        const double ratioPercent = hit.total / static_cast<double>(fullAreaInt) * 100.0;
         if (options.mode == lowyd::SEARCH_MODE_FULL_MAP_PIT)
         {
             out << "/tp " << hit.x << " " << options.afkY << " " << hit.z
@@ -1241,7 +1256,7 @@ int runPointScore(const Options &options)
     std::cout << "point total=" << last.total
               << " cave=" << last.cave
               << " river=" << last.river
-              << " pct=" << (100.0 * last.total / lowyd::RIVER_AREA_FULL)
+              << " pct=" << (100.0 * last.total / static_cast<double>(fullAreaFor(options)))
               << " min_ms=" << minMs
               << " avg_ms=" << (sumMs / options.pointRepeat) << "\n";
 

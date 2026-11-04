@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,8 @@ namespace lowyd {
 constexpr int RING_OUTER = 128;
 /** Inner no-spawn sphere used by the shell model (distance 24 around the AFK point). */
 constexpr int RING_INNER = 24;
-/** Display denominator: full 24..128 shell cell count at the default AFK Y=-40. */
-constexpr double RIVER_AREA_FULL = 49659.0;
+/* RIVER_AREA_FULL (the display denominator) is derived below from the exact
+ * shell cell counts; see fullShellArea(). */
 /** One maximum per 64x64 block cell when results are prepared for display. */
 constexpr int OUTPUT_REGION_SIZE = 64;
 
@@ -64,10 +65,36 @@ constexpr int COARSE_Y_DEFAULT = -51;
  * AFK / player Y used by the shell model and by the /tp result line.  The
  * scored region is the 3D shell 24 < distance <= 128 around
  * (result x, afkY, result z).
+ *
+ * Default: the lowest sampled layer plus 23 blocks.  While every layer stays
+ * within +-24 blocks of the AFK Y the shell cross-section area is identical on
+ * every layer (the dy^2 terms cancel), so the whole plateau is equivalent;
+ * +23 keeps the window inside it with one block of margin at the lower edge.
+ * For the default -63..-51 window this is -40.
  */
-constexpr int AFK_Y_DEFAULT = -40;
+constexpr int AFK_OFFSET_FROM_Y_MIN = 23;
+constexpr int defaultAfkY(int yMin) { return yMin + AFK_OFFSET_FROM_Y_MIN; }
+constexpr int AFK_Y_DEFAULT = defaultAfkY(Y_DEFAULT_MIN);
 constexpr int AFK_Y_LIMIT_MIN = -64;
 constexpr int AFK_Y_LIMIT_MAX = 320;
+/** Marker for "derive AFK Y from yMin"; SearchParams.afkY may carry it. */
+constexpr int AFK_Y_AUTO = std::numeric_limits<int>::min();
+/**
+ * Resolve SearchParams::afkY: AFK_Y_AUTO means lowest layer + 23, clamped into
+ * the legal AFK range so a very high layer window cannot produce an AFK Y that
+ * validate() then rejects for the wrong reason.
+ */
+constexpr int resolveAfkY(int yMin, int afkY)
+{
+    if (afkY != AFK_Y_AUTO)
+        return afkY;
+    const int derived = defaultAfkY(yMin);
+    if (derived < AFK_Y_LIMIT_MIN)
+        return AFK_Y_LIMIT_MIN;
+    if (derived > AFK_Y_LIMIT_MAX)
+        return AFK_Y_LIMIT_MAX;
+    return derived;
+}
 
 /** Layer range of the precise pass.  L = yMax - yMin + 1, capped at 1..Y_MAX_SPAN. */
 struct PreciseYRange {
@@ -148,6 +175,85 @@ inline bool onShellPlatform(int yMin, int yMax, int playerY)
 {
     return playerY - yMin <= RING_INNER && yMax - playerY <= RING_INNER;
 }
+
+/** Integer floor square root; constexpr so the denominator is a compile-time value. */
+constexpr int isqrtFloor(long long value)
+{
+    if (value <= 0)
+        return 0;
+    long long lo = 0;
+    long long hi = 1;
+    while (hi * hi <= value)
+        hi *= 2;
+    while (lo + 1 < hi)
+    {
+        const long long mid = (lo + hi) / 2;
+        if (mid * mid <= value)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return (int) lo;
+}
+
+/**
+ * Block centres inside the 24..128 shell at vertical offset dy.
+ *
+ * Exactly the count the runtime masks sum: for each dz row
+ *   outer = floor(sqrt(128^2 - dy^2 - dz^2))
+ *   inner = floor(sqrt(24^2  - dy^2 - dz^2))  (>= 0 only inside the no-spawn sphere)
+ * and a row contributes 2*outer+1, minus 2*inner+1 when the inner sphere cuts it.
+ * Returns 0 when |dy| > 128.
+ */
+constexpr long long shellLayerCellCount(int dy)
+{
+    const long long dy2 = (long long) dy * (long long) dy;
+    const long long outer2 = (long long) RING_OUTER * RING_OUTER;
+    if (dy2 > outer2)
+        return 0;
+    long long total = 0;
+    for (int dz = -RING_OUTER; dz <= RING_OUTER; ++dz)
+    {
+        const long long dz2 = (long long) dz * (long long) dz;
+        const long long out2 = outer2 - dy2 - dz2;
+        if (out2 < 0)
+            continue;
+        total += 2 * (long long) isqrtFloor(out2) + 1;
+        const long long in2 = (long long) RING_INNER * RING_INNER - dy2 - dz2;
+        if (in2 >= 0)
+            total -= 2 * (long long) isqrtFloor(in2) + 1;
+    }
+    return total;
+}
+
+/**
+ * Exact display denominator of the current model: the shell cell counts summed
+ * over the sampled layers, divided by the layer count and rounded.
+ *
+ * 1.0 therefore means "every layer is a full 24..128 shell cross-section", and
+ * `total / fullShellArea(yMin, yMax, afkY)` is the reported percentage.  The
+ * value is derived from the geometry, not fitted: the default -63..-51 window
+ * with afkY = yMin + 23 gives exactly 49659 (proved by the static_assert below).
+ */
+constexpr int fullShellArea(int yMin, int yMax, int afkY)
+{
+    int layers = yMax - yMin + 1;
+    if (layers < 1)
+        layers = 1;
+    if (layers > Y_MAX_SPAN)
+        layers = Y_MAX_SPAN;
+    long long sum = 0;
+    for (int layer = 0; layer < layers; ++layer)
+        sum += shellLayerCellCount(yMin + layer - afkY);
+    return (int) ((sum + layers / 2) / layers);
+}
+
+/** Display denominator of the default model; equals the historical 49659. */
+constexpr int RIVER_AREA_FULL_CELLS =
+    fullShellArea(Y_DEFAULT_MIN, Y_DEFAULT_MAX, defaultAfkY(Y_DEFAULT_MIN));
+static_assert(RIVER_AREA_FULL_CELLS == 49659,
+              "the default 24..128 shell denominator is expected to be 49659");
+constexpr double RIVER_AREA_FULL = RIVER_AREA_FULL_CELLS;
 
 /**
  * Export / result tag including the aggregation model, layer count and AFK Y.
@@ -239,19 +345,24 @@ struct SearchParams {
     int height = 0;
     int minArea = 0;
     float preserveRange = DEFAULT_PRESERVE_RANGE;
-    float riverWeight = 0.75f;
+    float riverWeight = 0.7f;
     /**
      * Precise layer window (B1).  yMax - yMin + 1 must be <= Y_MAX_SPAN; see
      * validate().  The score is the per-layer average of the cave/river volume,
-     * so it keeps the 0..49659 scale regardless of the layer count.
+     * so it stays on the 0..fullShellArea(yMin, yMax, afkY) scale regardless of
+     * the layer count (the default window gives 49659).
      */
     int yMin = Y_DEFAULT_MIN;
     int yMax = Y_DEFAULT_MAX;
     /**
      * AFK / player Y of the shell model.  The scored region is the 3D shell
-     * 24 < distance <= 128 around (x, afkY, z) for every candidate (x, z).
+     * 24 < distance <= 128 around (x, afkY, z).
+     *
+     * Defaults to {@link AFK_Y_AUTO}, which the engine resolves to
+     * {@link defaultAfkY}(yMin) = lowest layer + 23.  Pass an explicit value to
+     * pin it (the CLI's --afk-y and the Java GUI do).
      */
-    int afkY = AFK_Y_DEFAULT;
+    int afkY = AFK_Y_AUTO;
     /**
      * Recall knob of the coarse stage.  The climate prefilter used by this
      * engine (continentalness + weirdness) is Y-independent, so the value is
@@ -292,10 +403,12 @@ inline bool validate(const SearchParams &params, std::string *error)
         return false;
     };
 
-    if (params.afkY < AFK_Y_LIMIT_MIN || params.afkY > AFK_Y_LIMIT_MAX)
+    /* AFK Y: AFK_Y_AUTO resolves to the lowest layer + 23 before the range check. */
+    const int afkY = resolveAfkY(yMin, params.afkY);
+    if (afkY < AFK_Y_LIMIT_MIN || afkY > AFK_Y_LIMIT_MAX)
         return fail("AFK Y must stay within [" + std::to_string(AFK_Y_LIMIT_MIN) + ", "
                     + std::to_string(AFK_Y_LIMIT_MAX) + "] (got "
-                    + std::to_string(params.afkY) + ")");
+                    + std::to_string(afkY) + ")");
     if (yMin > yMax)
         return fail("yMin (" + std::to_string(yMin) + ") must not be greater than yMax ("
                     + std::to_string(yMax) + ")");

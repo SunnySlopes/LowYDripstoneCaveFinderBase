@@ -17,6 +17,14 @@ JNIEXPORT jintArray JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveF
 
 /*
  * Class:     sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge
+ * Method:    fullShellArea
+ * Signature: (III)I
+ */
+JNIEXPORT jint JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge_fullShellArea
+  (JNIEnv *, jclass, jint, jint, jint);
+
+/*
+ * Class:     sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge
  * Method:    getSearchProgress
  * Signature: ()[I
  */

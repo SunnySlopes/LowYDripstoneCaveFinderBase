@@ -12,7 +12,7 @@ cubiomes 作为嵌套 git 子模块放在 `cubiomes/`，可以独立构建，不
 
 对每个候选点 `(x, z)`：
 
-- 挂机点/球心：`(x, afkY, z)`，默认 `afkY = -40`，允许 `-64..320`；
+- 挂机点/球心：`(x, afkY, z)`，默认 `afkY = yMin + 23`（默认窗口即 `-40`），允许 `-64..320`；
 - 采样层：`yMin..yMax`，默认 `-63..-51`（13 层），跨度上限 48 层；
 - 每层 `dy = y - afkY`，只统计满足
   `24² < dx² + dy² + dz² ≤ 128²` 的洞穴/河流格；
@@ -25,8 +25,14 @@ cave  = round(Σcave / L)
 river = round(Σriver / L)
 ```
 
-`total` 以 `49659`（默认 AFK=-40 的满球壳格数）作为 GUI 显示标定；`riverWeight`
-范围 `[0,1]`。满面积溶洞的 total 为 49659，占比 100.00%。
+`total` 的显示分母**由几何精确推导**：把 `[yMin, yMax]` 每层的 24–128 球壳格数
+求和后除以层数并四舍五入（`lowyd::fullShellArea(yMin, yMax, afkY)`）。默认窗口
+`-63..-51` 配 `afkY = -40` 时恰为 **49659**（代码里有 `static_assert` 固定这个
+推导结果，不是拟合常数）。层范围或挂机 Y 一变，分母随之变化，因此占比始终是
+"该模型下的 0%..100%"。
+
+`riverWeight` 默认 `0.7`（CLI 与 base 同步），范围 `[0,1]`；满面积溶洞的
+total 等于该分母，占比 100.00%。
 
 结果集模型标识：
 
@@ -88,23 +94,23 @@ cmake --build build --target DripstoneCaveFinderLibJ
 
 ```powershell
 # 默认快速模式，131072 × 131072 区域
-.\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --out result.txt
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 --out result.txt
 
 # 精确模式 + 正方形区域
-.\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --mode precise `
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 --mode precise `
     --square 262144 --out precise.txt
 
 # 大坑模式
-.\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --mode pit `
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 --mode pit `
     --min-x -30000000 --max-x 30000000 --min-z -30000000 --max-z 30000000 `
     --out pit.txt
 
 # 自定义采样层与挂机 Y
-.\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --square 131072 `
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 --square 131072 `
     --y-min -60 --y-max -52 --afk-y -40 --out y9.txt
 
 # weirdness y-offset（独立接口）
-.\build\cli\lowydripstonecavefinder-cli.exe --weirdness-y-offset 12345
+.\build\cli\lowydripstonecavefinder-cli.exe --weirdness-y-offset 6900457
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -114,10 +120,10 @@ cmake --build build --target DripstoneCaveFinderLibJ
 | `--mc <id\|version>` | `26.3` | 版本名、`1.18~26.1`、`26.2+` 或 cubiomes `MCVersion` 数值 |
 | `--min-x` / `--max-x` / `--min-z` / `--max-z` | `-65536..65535` | 用户搜索区域（含端点） |
 | `--square <side>` | 未设置 | 以 (0,0) 为中心的正方形；不能与显式边界同用 |
-| `--min-area` | fast/precise `34761`，pit `44693` | 加权总面积下限（满值 49659） |
-| `--river-weight <float>` | `0.75` | `total = cave + river * weight`，范围 `[0,1]` |
+| `--min-area` | fast/precise `34761`，pit `44693` | 加权总面积下限（满值 = 当前层范围/挂机 Y 的精确球壳分母，默认窗口为 49659） |
+| `--river-weight <float>` | `0.7` | `total = cave + river * weight`，范围 `[0,1]` |
 | `--y-min` / `--y-max` | `-63` / `-51` | 采样层范围；跨度必须 ≤ 48，越界或倒置直接报错 |
-| `--afk-y` | `-40` | 挂机/玩家 Y；球壳中心为 `(x, afk-y, z)` |
+| `--afk-y` | `y-min + 23` | 挂机/玩家 Y；球壳中心为 `(x, afk-y, z)`（默认窗口即 -40） |
 | `--coarse-y` | `-51` | 粗筛召回高度；粗筛气候门与 Y 无关，仅保留协议字段 |
 | `--threads` | CPU 数 | 1–256 |
 | `--limit` | `0` | 最多输出条数；0 表示全部 |
@@ -180,6 +186,8 @@ riverSearch(long seed, int startX, int startZ, int width, int height,
 
 每次命中 5 个 `int`：`x, z, total, cave, river`；无结果返回 `null`。
 
+- `fullShellArea(int yMin, int yMax, int afkY)`：当前层范围/挂机 Y 的精确显示分母
+  （`afkY = Integer.MIN_VALUE` 表示 `yMin + 23`）。
 - `getSearchProgress()`：`[current, total, phase, status, tryPause, tryStop]`。
 - `getNowResult()`：与 `riverSearch` 相同的扁平布局。
 - `pause()` / `resume()` / `stop()`。
@@ -304,7 +312,7 @@ down to a specific block. This stage evaluates climate only, not full biomes.
 
 **步骤 4 · 1:1 完整群系评分 / Step 4 · Full-biome scoring at 1:1.** 在候选点周围
 320×320 的窗口内，以 1:1 逐层采样 `[yMin, yMax]` 的真实群系（默认 13 层）。
-每层只统计以挂机点 `(x, -40, z)` 为球心的 24–128 球壳截面，球壳内全部洞穴/河流格
+每层只统计以挂机点 `(x, afkY, z)` 为球心的 24–128 球壳截面，球壳内全部洞穴/河流格
 都计入；逐层求和后取平均：
 
 ```text
@@ -317,7 +325,7 @@ total = round((Σcave + riverWeight × Σriver) / L)
 
 In a 320×320 window around each candidate, sample the real biomes at 1:1 on every
 layer in `[yMin, yMax]` (13 by default). Each layer counts only its 24–128 shell
-cross-section around `(x, -40, z)`; every cave/river cell inside the shell counts.
+cross-section around `(x, afkY, z)`; every cave/river cell inside the shell counts.
 The layer sums are averaged:
 
 ```text
@@ -393,12 +401,12 @@ Re-check the climate at a 4-block step in a 512×512 window around the peak to c
 the cave area is large enough.
 
 **步骤 5 · 1:1 完整群系评分 / Step 5 · Full-biome scoring at 1:1.** 在同一 512×512
-窗口内按 1:1 逐层采样 `[yMin, yMax]` 的真实群系，每层按以 `(x, -40, z)` 为球心的
+窗口内按 1:1 逐层采样 `[yMin, yMax]` 的真实群系，每层按以 `(x, afkY, z)` 为球心的
 24–128 球壳统计（球壳内全部计入），逐层平均，达标才输出。步骤 4–5 的耗时从几秒到
 几分钟不等，取决于步骤 2 的结果数：结果越多，越可能藏着全图最大的溶洞。
 
 The same 512×512 window is sampled at 1:1 on every layer in `[yMin, yMax]`; each layer
-is scored over the 24–128 shell around `(x, -40, z)` with every cell counted, then the
+is scored over the 24–128 shell around `(x, afkY, z)` with every cell counted, then the
 layers are averaged. Only qualifying results are emitted. Stages 4–5 take anywhere from
 seconds to minutes depending on how many peaks survived step 2: the more survivors,
 the better the chance that the map's largest cave is among them.
@@ -445,7 +453,7 @@ The score is computed by `lowyd::weirdnessYOffset(seed)`
 不传该参数时引擎只额外做一次 relaxed 原子读，几乎没有开销：
 
 ```powershell
-.\build\cli\lowydripstonecavefinder-cli.exe --seed 12345 --square 2000001 --threads 8 --bench
+.\build\cli\lowydripstonecavefinder-cli.exe --seed 6900457 --square 2000001 --threads 8 --bench
 ```
 
 输出包含五个阶段（阶段 0 octave 表 / Cont 预筛掩膜 / Weird 环扫 / ClimateCoarse /
@@ -467,12 +475,16 @@ Chebyshev 写入次数、A 表体积与样本数），以及进程峰值工作�
 | 用例 | 内容 |
 | --- | --- |
 | `volume_unit` | 球壳几何（逐行半径/内孔/`|dy|>128`）、层范围/挂机 Y 校验、model id |
-| `column_reference` | 8 个版本 × 1 种子 × 3 个 3×3×13 窗口，共 2808 格逐格比对；另验证 `genBiomes` 与 `getBiomeAt` 一致 |
+| `column_reference` | 2 个代际基（`1.18~26.1`→`MC_26_1`、`26.2+`→`MC_26_3`）× 种子 `6900457` × 4 个搜索点窗口（`816,-542`、`316087,-267972`、`16043916,15695385`、`-875950,346633` 各 3×3×13），共 936 格逐格比对；另验证 `genBiomes` 与 `getBiomeAt` 一致 |
+
+`column_reference` 的参照表 `tests/drowned-original-reference.tsv` 每行一个方块群系
+（`版本 种子 x y z 群系ID 群系名`）。任何一个（代际基, 窗口）组合缺失都会直接失败，
+防止用例被悄悄缩小；窗口外出现行也判失败。
 
 运行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tests\run_tests_msys2.ps1
+powershell -File tests\run_tests_msys2.ps1
 ```
 
 或 CTest：

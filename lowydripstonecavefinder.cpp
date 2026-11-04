@@ -358,6 +358,11 @@ std::vector<Hit> search(const SearchParams &params)
 
     const PreciseYRange yRange{params.yMin, params.yMax};
 
+    /* AFK Y: AFK_Y_AUTO (the default) means "lowest sampled layer + 23"; the
+     * whole 24..128 shell plateau is equivalent, so this keeps the window at a
+     * fixed offset from the layer range instead of a hard-coded -40. */
+    const int afkY = resolveAfkY(params.yMin, params.afkY);
+
     float riverWeight = params.riverWeight;
     if (riverWeight < 0.0f) riverWeight = 0.0f;
     if (riverWeight > 1.0f) riverWeight = 1.0f;
@@ -401,7 +406,7 @@ std::vector<Hit> search(const SearchParams &params)
         {
             finallyResults = runLargePitSearch(&g, params.minArea, riverWeight, threads, &g_progress,
                                                boxMinX, boxMaxX, boxMinZ, boxMaxZ, yRange,
-                                               params.afkY);
+                                               afkY);
         }
         catch (const std::bad_alloc &)
         {
@@ -605,7 +610,7 @@ std::vector<Hit> search(const SearchParams &params)
                             cand.point.y - SearchConfig::REFINE_HALF_WINDOW,
                             SearchConfig::REFINE_WINDOW_BLOCKS, SearchConfig::REFINE_WINDOW_BLOCKS,
                             minArea, 1.0, FilterMode::PreciseBiome, riverWeight,
-                            nullptr, 0, nullptr, yRange, params.afkY);
+                            nullptr, 0, nullptr, yRange, afkY);
 
                         if (!temp.empty() && temp[0].area >= minArea)
                             g_results.addResult(temp[0]);

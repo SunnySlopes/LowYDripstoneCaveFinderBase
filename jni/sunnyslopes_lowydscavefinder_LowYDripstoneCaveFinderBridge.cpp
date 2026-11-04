@@ -90,10 +90,20 @@ JNIEXPORT jintArray JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveF
     return toIntArray(env, lowyd::search(params));
 }
 
+/**
+ * Exact display denominator for one model configuration: the summed 24..128
+ * shell cell counts over [yMin, yMax] divided by the layer count.
+ * afkY may be lowyd::AFK_Y_AUTO (Integer.MIN_VALUE) to mean "yMin + 23".
+ */
+JNIEXPORT jint JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge_fullShellArea
+  (JNIEnv *, jclass, jint yMin, jint yMax, jint afkY)
+{
+    return static_cast<jint>(lowyd::fullShellArea(yMin, yMax, lowyd::resolveAfkY(yMin, afkY)));
+}
+
 JNIEXPORT jintArray JNICALL Java_sunnyslopes_lowydscavefinder_LowYDripstoneCaveFinderBridge_getSearchProgress
   (JNIEnv *env, jclass)
-{
-    const lowyd::ProgressView view = lowyd::getProgress();
+{    const lowyd::ProgressView view = lowyd::getProgress();
     if (!view.available)
         return nullptr;
 

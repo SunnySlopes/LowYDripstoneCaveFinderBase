@@ -744,6 +744,7 @@ static lowyd::PointScore scorePrefilled(const std::vector<int> &prefixRiver,
                                  const lowyd::SearchParams &params, int coverage)
 {
     const int layers = params.yMax - params.yMin + 1;
+    const int afkY = lowyd::resolveAfkY(params.yMin, params.afkY);
     const int stride = W + 1;
     const size_t perLayer = (size_t) stride * (size_t) (W + 1);
     const int cx = W / 2;
@@ -765,7 +766,7 @@ static lowyd::PointScore scorePrefilled(const std::vector<int> &prefixRiver,
     {
         for (int layer = 0; layer < layers; layer++)
         {
-            const RingMask mask = makeShellMask(params.yMin + layer - params.afkY);
+            const RingMask mask = makeShellMask(params.yMin + layer - afkY);
             if (mask.rows.empty())
                 continue;
             const size_t base = (size_t) layer * perLayer;
@@ -837,6 +838,7 @@ lowyd::PointCentroids pointCaveCentroids(Generator *g, int x, int z,
     const int stride = W + 1;
     const size_t perLayer = (size_t) stride * (size_t) (W + 1);
     const int layers = params.yMax - params.yMin + 1;
+    const int afkY = lowyd::resolveAfkY(params.yMin, params.afkY);
     const int cx = W / 2;
     const int cz = W / 2;
 
@@ -852,7 +854,7 @@ lowyd::PointCentroids pointCaveCentroids(Generator *g, int x, int z,
 
     for (int layer = 0; layer < layers; layer++)
     {
-        const int dy = params.yMin + layer - params.afkY;
+        const int dy = params.yMin + layer - afkY;
         const int *cavePlane = prefixCave.data() + (size_t) layer * perLayer;
         for (int dz = -lowyd::RING_OUTER; dz <= lowyd::RING_OUTER; dz++)
         {
